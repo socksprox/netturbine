@@ -4,7 +4,7 @@ import '../app/app_state.dart';
 import 'temp_page.dart';
 import 'widgets/boost_button.dart';
 import 'widgets/fan_card.dart';
-import 'widgets/segmented_tabs.dart';
+import 'widgets/segmented_selector.dart';
 import 'widgets/settings_section.dart';
 
 /// Compact popover-style body shown when the tray icon is clicked.
@@ -39,8 +39,13 @@ class _HomePageState extends State<HomePage> {
                 ],
               ),
               const SizedBox(height: 12),
-              SegmentedTabs(
-                items: const ['Fan Control', 'Temperature'],
+              SegmentedSelector<int>(
+                options: const [
+                  SegmentOption(
+                      value: 0, label: 'Fan Control', icon: Icons.wind_power),
+                  SegmentOption(
+                      value: 1, label: 'Temperature', icon: Icons.thermostat),
+                ],
                 selected: _tab,
                 onChanged: (i) => setState(() => _tab = i),
               ),
