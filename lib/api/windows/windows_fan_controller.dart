@@ -13,9 +13,10 @@ import '../fan_controller.dart';
 ///   setSpeed(fanId, percent)   -> null
 ///   resetToAuto(fanId)         -> null
 ///
-/// Until a real hardware backend (EC/driver/vendor SDK) is wired into the
-/// runner, the channel reports zero fans and this controller degrades to
-/// "unsupported" — the UI disables its controls accordingly.
+/// The runner proxies to the elevated NetturbineFanHelper service over
+/// \\.\pipe\netturbine_fan (EC registers via PawnIO). When the helper is not
+/// installed or running the channel reports zero fans and the UI disables its
+/// controls accordingly.
 class WindowsFanController implements FanController {
   static const _channel = MethodChannel('netturbine/fan');
   static const _pollInterval = Duration(seconds: 2);

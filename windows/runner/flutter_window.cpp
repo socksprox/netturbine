@@ -15,6 +15,72 @@ constexpr const wchar_t kRunKeyPath[] =
     L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 constexpr const wchar_t kRunValueName[] = L"netturbine";
 
+// Sends one line to the elevated fan helper over \\.\pipe\netturbine_fan and
+// reads back one reply line. Returns false when the helper is unreachable.
+// Protocol (see windows/tools/fan_helper.cpp):
+//   "list"      -> "ok <count>"
+//   "read <i>"  -> "ok <percent 0-100>"
+//   "mode <i>"  -> "ok <0 auto | 1 manual>"
+//   "set <i> <percent>" / "auto <i>" -> "ok" | "err <msg>"
+bool PipeRequest(const std::string& cmd, std::string* reply) {
+  HANDLE pipe = CreateFileW(L"\\\\.\\pipe\\netturbine_fan",
+                            GENERIC_READ | GENERIC_WRITE, 0, nullptr,
+                            OPEN_EXISTING, 0, nullptr);
+  if (pipe == INVALID_HANDLE_VALUE) {
+    if (GetLastError() != ERROR_PIPE_BUSY ||
+        !WaitNamedPipeW(L"\\\\.\\pipe\\netturbine_fan", 3000)) {
+      return false;
+    }
+    pipe = CreateFileW(L"\\\\.\\pipe\\netturbine_fan",
+                       GENERIC_READ | GENERIC_WRITE, 0, nullptr,
+                       OPEN_EXISTING, 0, nullptr);
+    if (pipe == INVALID_HANDLE_VALUE) {
+      return false;
+    }
+  }
+  std::string line = cmd + "\n";
+  DWORD n = 0;
+  bool ok = WriteFile(pipe, line.c_str(), static_cast<DWORD>(line.size()), &n,
+                      nullptr);
+  char buf[256];
+  if (ok) {
+    ok = ReadFile(pipe, buf, sizeof(buf) - 1, &n, nullptr) && n > 0;
+  }
+  CloseHandle(pipe);
+  if (!ok) {
+    return false;
+  }
+  buf[n] = 0;
+  *reply = buf;
+  while (!reply->empty() &&
+         (reply->back() == '\n' || reply->back() == '\r')) {
+    reply->pop_back();
+  }
+  return true;
+}
+
+// Checks a reply is "ok ..." and optionally parses the trailing integer.
+bool PipeOk(const std::string& reply, int* value = nullptr) {
+  if (reply.rfind("ok", 0) != 0) {
+    return false;
+  }
+  if (value != nullptr) {
+    if (sscanf_s(reply.c_str(), "ok %d", value) != 1) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// "fan0" -> 0, "fan1" -> 1; anything else -> -1.
+int ParseFanId(const flutter::EncodableValue& arg) {
+  const auto* s = std::get_if<std::string>(&arg);
+  if (s == nullptr || s->rfind("fan", 0) != 0) {
+    return -1;
+  }
+  return atoi(s->c_str() + 3);
+}
+
 bool IsLaunchAtStartupEnabled() {
   HKEY key;
   if (RegOpenKeyExW(HKEY_CURRENT_USER, kRunKeyPath, 0, KEY_READ, &key) !=
@@ -149,31 +215,91 @@ void FlutterWindow::HandleSystemCall(
 }
 
 // Fan backend contract for lib/api/windows/windows_fan_controller.dart.
-// TODO(fan-backend): hardware access is driver/EC/vendor-specific — pick a
-// mechanism (e.g. WMI CIM, a kernel driver, or a vendor SDK) and fill this in.
-// Until then the app reports zero controllable fans and degrades gracefully.
+// Proxies to the elevated NetturbineFanHelper service via
+// \\.\pipe\netturbine_fan (PawnIO + EC registers, see windows/tools/).
+// When the helper is not installed/running, reports zero fans so the UI
+// degrades gracefully.
 void FlutterWindow::HandleFanCall(
     const flutter::MethodCall<flutter::EncodableValue>& call,
     std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result) {
   const auto& name = call.method_name();
   if (name == "getFans") {
+    std::string reply;
+    int count = 0;
+    bool up = PipeRequest("list", &reply) && PipeOk(reply, &count);
     flutter::EncodableMap capabilities{
         {flutter::EncodableValue("canReadRpm"), flutter::EncodableValue(false)},
-        {flutter::EncodableValue("canSetSpeed"),
-         flutter::EncodableValue(false)},
+        {flutter::EncodableValue("canSetSpeed"), flutter::EncodableValue(up)},
     };
+    flutter::EncodableList fans;
+    for (int i = 0; i < (up ? count : 0); i++) {
+      int percent = 0;
+      bool readable =
+          PipeRequest("read " + std::to_string(i), &reply) &&
+          PipeOk(reply, &percent);
+      int manual = 0;
+      PipeRequest("mode " + std::to_string(i), &reply);
+      PipeOk(reply, &manual);
+      flutter::EncodableMap fan{
+          {flutter::EncodableValue("id"),
+           flutter::EncodableValue("fan" + std::to_string(i))},
+          {flutter::EncodableValue("label"),
+           flutter::EncodableValue("Fan " + std::to_string(i + 1))},
+          {flutter::EncodableValue("speedPercent"),
+           readable ? flutter::EncodableValue(percent)
+                    : flutter::EncodableValue()},
+          {flutter::EncodableValue("canControl"),
+           flutter::EncodableValue(true)},
+          {flutter::EncodableValue("isAuto"),
+           flutter::EncodableValue(manual == 0)},
+      };
+      fans.push_back(flutter::EncodableValue(fan));
+    }
     flutter::EncodableMap payload{
         {flutter::EncodableValue("capabilities"),
          flutter::EncodableValue(capabilities)},
-        {flutter::EncodableValue("fans"), flutter::EncodableValue(
-                                             flutter::EncodableList{})},
+        {flutter::EncodableValue("fans"), flutter::EncodableValue(fans)},
     };
     result->Success(flutter::EncodableValue(payload));
-  } else if (name == "setSpeed" || name == "resetToAuto") {
-    result->Error("unsupported", "No fan backend is available yet.");
-  } else {
-    result->NotImplemented();
+    return;
   }
+  if (name == "setSpeed" || name == "resetToAuto") {
+    const auto* args = std::get_if<flutter::EncodableMap>(call.arguments());
+    if (args == nullptr) {
+      result->Error("bad_args", "Expected a map of arguments.");
+      return;
+    }
+    auto it = args->find(flutter::EncodableValue("fanId"));
+    int fan = it == args->end() ? -1 : ParseFanId(it->second);
+    std::string cmd;
+    if (name == "setSpeed") {
+      auto pi = args->find(flutter::EncodableValue("percent"));
+      int pct = pi == args->end() ? -1 : std::get<int>(pi->second);
+      if (fan < 0 || pct < 0 || pct > 100) {
+        result->Error("bad_args", "fanId or percent invalid.");
+        return;
+      }
+      cmd = "set " + std::to_string(fan) + " " + std::to_string(pct);
+    } else {
+      if (fan < 0) {
+        result->Error("bad_args", "fanId invalid.");
+        return;
+      }
+      cmd = "auto " + std::to_string(fan);
+    }
+    std::string reply;
+    if (!PipeRequest(cmd, &reply)) {
+      result->Error("unavailable", "Fan helper service is not running.");
+      return;
+    }
+    if (!PipeOk(reply)) {
+      result->Error("ec_error", reply);
+      return;
+    }
+    result->Success();
+    return;
+  }
+  result->NotImplemented();
 }
 
 LRESULT
