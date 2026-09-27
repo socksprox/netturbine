@@ -8,8 +8,10 @@
 //   ping                -> "pong"
 //   list                -> "ok <n>"            (fan count)
 //   read <fan>          -> "ok <percent>"      (0-100)
+//   mode <fan>          -> "ok <0|1>"          (0 auto, 1 manual hold)
 //   set <fan> <pct>     -> "ok"                (holds fan at pct)
 //   auto <fan>          -> "ok"                (firmware control)
+//   temp                -> "ok <celsius>"      (CPU package temp)
 //   anything else       -> "err <msg>"
 //
 // Modes:
@@ -203,9 +205,85 @@ class Ec {
   char err_[128] = {};
 };
 
+// ------------------------------------------------------------- CPU temp
+
+// Reads the Intel package temperature via the PawnIO IntelMSR module:
+// IA32_TEMPERATURE_TARGET (0x1A2) bits 23:16 -> TjMax,
+// IA32_PACKAGE_THERM_STATUS (0x1B1) bit 31 = valid, bits 22:16 = readout.
+// Package temp = TjMax - readout.
+class CpuTemp {
+ public:
+  bool Init() {
+    HMODULE lib = LoadLibraryW(L"PawnIOLib.dll");
+    if (!lib)
+      lib = LoadLibraryW(L"C:\\Program Files\\PawnIO\\PawnIOLib.dll");
+    if (!lib) return false;
+    exec_ = (pawnio_execute_fn)GetProcAddress(lib, "pawnio_execute");
+    auto open = (pawnio_open_fn)GetProcAddress(lib, "pawnio_open");
+    auto load = (pawnio_load_fn)GetProcAddress(lib, "pawnio_load");
+    close_ = (pawnio_close_fn)GetProcAddress(lib, "pawnio_close");
+    if (!exec_ || !open || !load || !close_) return false;
+    if (FAILED(open(&pio_)) || !pio_) return false;
+
+    wchar_t dir[MAX_PATH];
+    GetModuleFileNameW(nullptr, dir, MAX_PATH);
+    wchar_t* slash = wcsrchr(dir, L'\\');
+    if (slash) *slash = 0;
+    std::wstring blobPath = std::wstring(dir) + L"\\IntelMSR.bin";
+    HANDLE f = CreateFileW(blobPath.c_str(), GENERIC_READ, FILE_SHARE_READ,
+                           nullptr, OPEN_EXISTING, 0, nullptr);
+    if (f == INVALID_HANDLE_VALUE) {
+      blobPath = L"C:\\Users\\user\\Code\\netturbine\\windows\\tools\\"
+                 L"pawnio_modules\\IntelMSR.bin";
+      f = CreateFileW(blobPath.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                      OPEN_EXISTING, 0, nullptr);
+      if (f == INVALID_HANDLE_VALUE) return false;
+    }
+    DWORD sz = GetFileSize(f, nullptr);
+    std::vector<BYTE> blob(sz);
+    DWORD rd = 0;
+    ReadFile(f, blob.data(), sz, &rd, nullptr);
+    CloseHandle(f);
+    if (FAILED(load(pio_, blob.data(), blob.size()))) return false;
+
+    ULONG64 tjField = 0;
+    if (ReadMsr(0x1A2, &tjField)) return false;
+    tjMax_ = (int)((tjField >> 16) & 0xFF);
+    if (tjMax_ <= 0 || tjMax_ > 130) tjMax_ = 100;  // sane default
+    return true;
+  }
+
+  ~CpuTemp() {
+    if (pio_ && close_) close_(pio_);
+  }
+
+  // Returns package temp in C, or -1 on error.
+  int Read() {
+    ULONG64 s = 0;
+    if (ReadMsr(0x1B1, &s)) return -1;
+    if (!(s & (1ULL << 31))) return -1;  // reading not valid
+    return tjMax_ - (int)((s >> 16) & 0x7F);
+  }
+
+ private:
+  int ReadMsr(ULONG64 msr, ULONG64* val) {
+    ULONG64 in[1] = {msr}, out[1] = {0};
+    SIZE_T ret = 0;
+    if (FAILED(exec_(pio_, "ioctl_read_msr", in, 1, out, 1, &ret))) return -1;
+    *val = out[0];
+    return 0;
+  }
+
+  HANDLE pio_ = nullptr;
+  pawnio_execute_fn exec_ = nullptr;
+  pawnio_close_fn close_ = nullptr;
+  int tjMax_ = 100;
+};
+
 // ------------------------------------------------------- pipe server layer
 
 static Ec g_ec;
+static CpuTemp g_temp;
 static volatile bool g_running = true;
 
 static std::string Handle(const std::string& line) {
@@ -240,6 +318,15 @@ static std::string Handle(const std::string& line) {
       return buf;
     }
     return "err ec";
+  }
+  if (!strcmp(cmd, "temp")) {
+    int t = g_temp.Read();
+    if (t >= 0) {
+      char buf[16];
+      sprintf_s(buf, "ok %d", t);
+      return buf;
+    }
+    return "err sensor";
   }
   return "err badcmd";
 }
@@ -316,6 +403,7 @@ static void WINAPI ServiceMain(DWORD, LPWSTR*) {
     SetServiceStatus(g_ss, &s);
     return;
   }
+  g_temp.Init();  // optional — temp reports "err sensor" when unavailable
   g_stopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
   g_serverThread = CreateThread(nullptr, 0, PipeServer, nullptr, 0, nullptr);
 
@@ -380,6 +468,7 @@ int wmain(int argc, wchar_t** argv) {
   }
   if (argc > 1 && !wcscmp(argv[1], L"console")) {
     if (!g_ec.Init()) { fprintf(stderr, "EC init: %s\n", g_ec.Error()); return 2; }
+    if (!g_temp.Init()) fprintf(stderr, "CPU temp sensor unavailable\n");
     printf("EC ready, serving \\\\.\\pipe\\netturbine_fan\n");
     PipeServer(nullptr);
     return 0;

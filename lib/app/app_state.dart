@@ -19,6 +19,7 @@ class AppState extends ChangeNotifier {
   StreamSubscription<List<FanInfo>>? _sub;
 
   List<FanInfo> fans = const [];
+  List<TempSensor> sensors = const [];
   bool launchAtStartup = false;
   bool backendError = false;
 
@@ -33,6 +34,7 @@ class AppState extends ChangeNotifier {
   Future<void> init() async {
     _sub = fan.fanStream.listen((snapshot) {
       fans = snapshot;
+      sensors = fan.sensors;
       notifyListeners();
     }, onError: (_) {
       backendError = true;

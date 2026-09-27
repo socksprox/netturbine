@@ -255,10 +255,22 @@ void FlutterWindow::HandleFanCall(
       };
       fans.push_back(flutter::EncodableValue(fan));
     }
+    flutter::EncodableList temps;
+    int celsius = 0;
+    if (up && PipeRequest("temp", &reply) && PipeOk(reply, &celsius)) {
+      flutter::EncodableMap sensor{
+          {flutter::EncodableValue("id"), flutter::EncodableValue("cpu")},
+          {flutter::EncodableValue("label"), flutter::EncodableValue("CPU")},
+          {flutter::EncodableValue("celsius"),
+           flutter::EncodableValue(celsius)},
+      };
+      temps.push_back(flutter::EncodableValue(sensor));
+    }
     flutter::EncodableMap payload{
         {flutter::EncodableValue("capabilities"),
          flutter::EncodableValue(capabilities)},
         {flutter::EncodableValue("fans"), flutter::EncodableValue(fans)},
+        {flutter::EncodableValue("temps"), flutter::EncodableValue(temps)},
     };
     result->Success(flutter::EncodableValue(payload));
     return;

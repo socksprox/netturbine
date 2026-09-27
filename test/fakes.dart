@@ -20,6 +20,9 @@ class FakeFanController implements FanController {
   List<FanInfo> fans;
 
   @override
+  List<TempSensor> sensors = const [];
+
+  @override
   FanCapabilities capabilities;
 
   void emit() => _stream.add(fans);

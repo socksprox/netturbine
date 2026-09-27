@@ -26,6 +26,21 @@ class FanInfo {
   final bool isAuto;
 }
 
+/// A live temperature sensor reading.
+class TempSensor {
+  const TempSensor({
+    required this.id,
+    required this.label,
+    this.celsius,
+  });
+
+  final String id;
+  final String label;
+
+  /// Reading in degrees Celsius, or null when unavailable.
+  final int? celsius;
+}
+
 /// What the backend supports on this machine.
 class FanCapabilities {
   const FanCapabilities({required this.canReadRpm, required this.canSetSpeed});
@@ -66,6 +81,10 @@ abstract class FanController {
   /// What the backend can do on this machine. Never assume a fan is
   /// controllable — check per-fan [FanInfo.canControl].
   FanCapabilities get capabilities;
+
+  /// Most recent temperature sensor snapshot. Empty when the backend has
+  /// no temperature telemetry.
+  List<TempSensor> get sensors;
 
   /// Overrides [fanId] to [percent] (0–100).
   Future<void> setSpeed(String fanId, int percent);

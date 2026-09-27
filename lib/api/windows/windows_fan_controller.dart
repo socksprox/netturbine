@@ -24,6 +24,7 @@ class WindowsFanController implements FanController {
   final _stream = StreamController<List<FanInfo>>.broadcast();
   Timer? _pollTimer;
   List<FanInfo> _fans = const [];
+  List<TempSensor> _sensors = const [];
   FanCapabilities _capabilities = FanCapabilities.none;
 
   WindowsFanController() {
@@ -39,9 +40,14 @@ class WindowsFanController implements FanController {
         _fans = [
           for (final f in (result['fans'] as List? ?? const [])) _parseFan(f),
         ];
+        _sensors = [
+          for (final s in (result['temps'] as List? ?? const []))
+            _parseSensor(s),
+        ];
       }
     } on MissingPluginException {
       _fans = const [];
+      _sensors = const [];
       _capabilities = FanCapabilities.none;
     } on PlatformException {
       // Backend transiently unavailable — keep last known snapshot.
@@ -57,6 +63,9 @@ class WindowsFanController implements FanController {
 
   @override
   FanCapabilities get capabilities => _capabilities;
+
+  @override
+  List<TempSensor> get sensors => _sensors;
 
   @override
   Future<void> setSpeed(String fanId, int percent) async {
@@ -94,6 +103,15 @@ class WindowsFanController implements FanController {
     return FanCapabilities(
       canReadRpm: raw['canReadRpm'] == true,
       canSetSpeed: raw['canSetSpeed'] == true,
+    );
+  }
+
+  static TempSensor _parseSensor(dynamic raw) {
+    final map = raw as Map;
+    return TempSensor(
+      id: map['id'] as String,
+      label: map['label'] as String? ?? map['id'] as String,
+      celsius: map['celsius'] as int?,
     );
   }
 

@@ -24,6 +24,9 @@ class UnsupportedFanController implements FanController {
   FanCapabilities get capabilities => FanCapabilities.none;
 
   @override
+  List<TempSensor> get sensors => const [];
+
+  @override
   Future<void> setSpeed(String fanId, int percent) =>
       throw const FanControlException(
           'Fan control is not supported on this platform.');

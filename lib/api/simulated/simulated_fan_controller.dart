@@ -68,6 +68,17 @@ class SimulatedFanController implements FanController {
       const FanCapabilities(canReadRpm: true, canSetSpeed: true);
 
   @override
+  List<TempSensor> get sensors => [
+        // Simulated CPU temp: warmer when fans are pushed, with slow drift.
+        TempSensor(
+          id: 'cpu',
+          label: 'CPU',
+          celsius: 42 + ((_tick * 2) % 30) ~/ 3 +
+              (_fans.first.percent - _fans.first.basePercent) ~/ 5,
+        ),
+      ];
+
+  @override
   Future<void> setSpeed(String fanId, int percent) async {
     final f = _fans.firstWhere((f) => f.id == fanId,
         orElse: () =>

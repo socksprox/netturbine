@@ -163,6 +163,9 @@ int main(int argc, char** argv) {
     wval = strtoull(argv[3], nullptr, 0);
   } else if (argc >= 3 && strcmp(argv[1], "read") == 0) {
     for (int i = 2; i < argc; i++) addrs.push_back(strtoull(argv[i], nullptr, 0));
+  } else if (argc >= 3 && strcmp(argv[1], "dump") == 0 &&
+             strcmp(argv[2], "all") == 0) {
+    for (ULONG64 a = 0; a < 256; a++) addrs.push_back(a);
   } else {
     // dump: all candidate fan registers from the DSDT field map
     const ULONG64 all[] = {0x95, 0x83, 0x94, 0x82, 0x93, 0x81, 0x3D};
