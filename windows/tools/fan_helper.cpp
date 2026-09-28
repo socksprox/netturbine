@@ -20,6 +20,10 @@
 //   fan_helper.exe uninstall  — stop + remove the service
 //   fan_helper.exe console    — run the pipe server in the foreground
 //   (no args, SCM-launched)   — service entry point
+//
+// Safety: a watchdog releases the manual-hold bits when no pipe command
+// arrives for ~30s, so a crashed/exited app never leaves fans pinned at
+// a stale setpoint.
 
 #include <windows.h>
 #include <winioctl.h>
@@ -328,8 +332,12 @@ static int SsdTemp(int drive) {
 static Ec g_ec;
 static CpuTemp g_temp;
 static volatile bool g_running = true;
+// Tick count of the last pipe command; the watchdog releases manual fan
+// holds when this goes stale (app crashed or exited).
+static volatile ULONGLONG g_lastCmd = 0;
 
 static std::string Handle(const std::string& line) {
+  g_lastCmd = GetTickCount64();
   char cmd[16], a[8], b[8];
   int n = sscanf_s(line.c_str(), "%15s %7s %7s", cmd, (unsigned)sizeof(cmd), a,
                    (unsigned)sizeof(a), b, (unsigned)sizeof(b));
@@ -415,6 +423,22 @@ static std::string Handle(const std::string& line) {
   return "err badcmd";
 }
 
+// Clears manual holds when the app goes quiet for ~30s. The app's poll
+// loop issues commands every few seconds while it runs, so this only
+// fires when the app is gone — firmware control is the safe fallback.
+static DWORD WINAPI Watchdog(LPVOID) {
+  const ULONGLONG kTimeoutMs = 30000;
+  while (g_running) {
+    Sleep(5000);
+    if (GetTickCount64() - g_lastCmd > kTimeoutMs) {
+      for (int i = 0; i < kFanCount; i++) {
+        if (g_ec.IsManual(i) == 1) g_ec.SetAuto(i);
+      }
+    }
+  }
+  return 0;
+}
+
 static DWORD WINAPI PipeWorker(LPVOID hp) {
   HANDLE pipe = (HANDLE)hp;
   char buf[256];
@@ -489,7 +513,10 @@ static void WINAPI ServiceMain(DWORD, LPWSTR*) {
   }
   g_temp.Init();  // optional — temp reports "err sensor" when unavailable
   g_stopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  g_lastCmd = GetTickCount64();  // arm watchdog: clear stale holds if
+                               // no app connects within the timeout
   g_serverThread = CreateThread(nullptr, 0, PipeServer, nullptr, 0, nullptr);
+  CreateThread(nullptr, 0, Watchdog, nullptr, 0, nullptr);
 
   s.dwCurrentState = SERVICE_RUNNING;
   s.dwControlsAccepted = SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN;
@@ -554,6 +581,8 @@ int wmain(int argc, wchar_t** argv) {
     if (!g_ec.Init()) { fprintf(stderr, "EC init: %s\n", g_ec.Error()); return 2; }
     if (!g_temp.Init()) fprintf(stderr, "CPU temp sensor unavailable\n");
     printf("EC ready, serving \\\\.\\pipe\\netturbine_fan\n");
+    g_lastCmd = GetTickCount64();
+    CreateThread(nullptr, 0, Watchdog, nullptr, 0, nullptr);
     PipeServer(nullptr);
     return 0;
   }

@@ -54,4 +54,10 @@ class UnsupportedSystemIntegration implements SystemIntegration {
 
   @override
   Future<void> quitApp() async {}
+
+  @override
+  Future<String?> loadSettings() async => null;
+
+  @override
+  Future<void> saveSettings(String json) async {}
 }

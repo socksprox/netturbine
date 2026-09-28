@@ -20,4 +20,12 @@ abstract class SystemIntegration {
 
   /// Quits the app (as opposed to hiding the window to the tray).
   Future<void> quitApp();
+
+  /// Loads the persisted settings blob (a JSON string owned by the app
+  /// layer), or null when nothing has been saved yet.
+  Future<String?> loadSettings();
+
+  /// Persists the settings blob. Best-effort — storage failures must not
+  /// take the app down.
+  Future<void> saveSettings(String json);
 }

@@ -3,7 +3,8 @@ import 'package:flutter/material.dart';
 import '../../api/fan_controller.dart';
 import '../../app/app_state.dart';
 
-/// One fan: label, live RPM, manual speed slider, "back to auto" affordance.
+/// One fan: label, live RPM/duty readout, and a speed slider — editable
+/// in Fixed mode, a read-only gauge in Auto/Profile mode and during boost.
 class FanCard extends StatefulWidget {
   const FanCard({super.key, required this.fan, required this.state});
 
@@ -21,13 +22,20 @@ class _FanCardState extends State<FanCard> {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final fan = widget.fan;
+    final state = widget.state;
+    final interactive = fan.canControl &&
+        state.fanMode == FanMode.fixed &&
+        !state.isBoosting;
+
     // The slider is a setpoint control: bind it to the requested speed,
     // not speedPercent. The measured duty ramps toward the setpoint over
     // seconds (and firmware can clamp it), so showing it here makes the
     // slider appear to bounce back right after release.
-    final target = fan.isAuto ? null : widget.state.manualTarget(fan.id);
-    final current =
-        _dragValue ?? (target ?? fan.speedPercent ?? 0).toDouble();
+    final target = fan.isAuto ? null : state.manualTarget(fan.id);
+    final measured = (fan.speedPercent ?? 0).toDouble();
+    final current = interactive
+        ? (_dragValue ?? target?.toDouble() ?? measured)
+        : measured;
 
     return Card(
       child: Padding(
@@ -56,14 +64,18 @@ class _FanCardState extends State<FanCard> {
                 children: [
                   Expanded(
                     child: Slider(
-                      value: current.clamp(0, 100),
+                      value: current.clamp(0.0, 100.0),
                       min: 0,
                       max: 100,
-                      onChanged: (v) => setState(() => _dragValue = v),
-                      onChangeEnd: (v) {
-                        _dragValue = null;
-                        widget.state.setSpeed(fan.id, v.round());
-                      },
+                      onChanged: interactive
+                          ? (v) => setState(() => _dragValue = v)
+                          : null,
+                      onChangeEnd: interactive
+                          ? (v) {
+                              _dragValue = null;
+                              state.setSpeed(fan.id, v.round());
+                            }
+                          : null,
                     ),
                   ),
                   SizedBox(
@@ -79,11 +91,11 @@ class _FanCardState extends State<FanCard> {
             else
               Text('Automatic — not controllable',
                   style: theme.textTheme.bodySmall),
-            if (fan.canControl && !fan.isAuto)
+            if (interactive && !fan.isAuto)
               Align(
                 alignment: Alignment.centerRight,
                 child: TextButton(
-                  onPressed: () => widget.state.resetToAuto(fan.id),
+                  onPressed: () => state.resetToAuto(fan.id),
                   child: const Text('Back to auto'),
                 ),
               ),

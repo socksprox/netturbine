@@ -13,6 +13,8 @@ Native OS integration lives here. Keep the Flutter runner template as close to s
 ## Fan backend (confirmed working)
 
 - `windows/tools/fan_helper.cpp` builds `fan_helper.exe` — a Windows service (`NetturbineFanHelper`) hosting the pipe. Commands: `ping`, `list`, `read <i>` (percent), `mode <i>` (0=auto/1=manual), `set <i> <pct>`, `auto <i>`, `temp` (CPU package °C), `temps` (all sensors as `label=celsius` pairs; `_` = space). Run `fan_helper.exe install` **elevated once** to register it; `console` runs it in the foreground for debugging. `LpcACPIEC.bin` and `IntelMSR.bin` must sit next to the exe.
+- Rebuild (VS dev prompt / vcvars64): `cl /EHsc /W3 /O2 fan_helper.cpp advapi32.lib` → produces `fan_helper.exe`; then swap the running service with `swap_helper.ps1` **elevated** (expects the new binary as `fan_helper_new.exe`).
+- **Watchdog**: the service clears the manual-hold bits when no pipe command arrives for ~30s. The app polls `getFans` every 2s while running, so this only fires after app exit/crash — firmware regains control rather than leaving fans pinned at a stale setpoint.
 - EC register map (from the machine's DSDT, verified live): fan 0 — read `0x95`, write `0x94`, hold `0x93` bit `0x10`; fan 1 — read `0x83`, write `0x82`, hold `0x81` bit `0x10`. Values are percent 0–100. Setting the hold bit makes the setpoint stick; clearing it returns the fan to firmware control.
 - `ec_probe.exe` in the same dir is a standalone read/write probe for debugging.
 - User-mode `IOCTL_ACPI_EVAL_METHOD` does **not** work on this machine (interface rejects with ERROR_NOT_SUPPORTED) — don't retry that path; PawnIO is the mechanism.

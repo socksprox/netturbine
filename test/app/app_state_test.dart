@@ -42,7 +42,6 @@ void main() {
       async.flushMicrotasks();
       expect(fan.speeds['cpu'], 100);
       expect(state.isBoosting, isTrue);
-      expect(state.manualTarget('cpu'), 100);
 
       async.elapse(AppState.boostDuration);
       async.flushMicrotasks();
@@ -107,6 +106,160 @@ void main() {
       expect(state.manualTarget('cpu'), isNull);
       expect(state.backendError, isTrue);
       state.dispose();
+    });
+  });
+
+  test('selectFixed holds the current speed as the target', () {
+    fakeAsync((async) {
+      final fan = FakeFanController(fans: [_cpu]); // speedPercent: 40
+      final state =
+          AppState(fan: fan, system: FakeSystemIntegration());
+      state.init();
+      async.flushMicrotasks();
+      fan.emit();
+      async.flushMicrotasks();
+
+      state.selectFixed();
+      async.flushMicrotasks();
+      expect(fan.speeds['cpu'], 40);
+      expect(state.fanMode, FanMode.fixed);
+      state.dispose();
+    });
+  });
+
+  test('selectAuto releases manual holds', () {
+    fakeAsync((async) {
+      final fan = FakeFanController(fans: [_cpu]);
+      final state =
+          AppState(fan: fan, system: FakeSystemIntegration());
+      state.init();
+      async.flushMicrotasks();
+      fan.emit();
+      async.flushMicrotasks();
+
+      state.selectFixed();
+      state.setSpeed('cpu', 70);
+      async.flushMicrotasks();
+      state.selectAuto();
+      async.flushMicrotasks();
+      expect(fan.resetCalls, contains('cpu'));
+      expect(state.manualTarget('cpu'), isNull);
+      state.dispose();
+    });
+  });
+
+  test('profile mode writes the curve output on each snapshot', () {
+    fakeAsync((async) {
+      final fan = FakeFanController(
+        fans: [_cpu],
+        sensors: const [
+          TempSensor(id: 'cpu', label: 'CPU', celsius: 70),
+        ],
+      );
+      final state =
+          AppState(fan: fan, system: FakeSystemIntegration());
+      state.init();
+      async.flushMicrotasks();
+      fan.emit();
+      async.flushMicrotasks();
+
+      // Balanced at 70°C = 50%.
+      state.selectProfile('balanced');
+      async.flushMicrotasks();
+      expect(state.fanMode, FanMode.profile);
+      expect(fan.speeds['cpu'], 50);
+      expect(state.manualTarget('cpu'), 50);
+
+      // Temperature rises above the hysteresis band → rewritten.
+      fan.sensors = const [
+        TempSensor(id: 'cpu', label: 'CPU', celsius: 90)
+      ];
+      fan.emit();
+      async.flushMicrotasks();
+      expect(fan.speeds['cpu'], 88);
+      state.dispose();
+    });
+  });
+
+  test('curve falls back to firmware when the sensor goes missing', () {
+    fakeAsync((async) {
+      final fan = FakeFanController(
+        fans: [_cpu],
+        sensors: const [
+          TempSensor(id: 'cpu', label: 'CPU', celsius: 70),
+        ],
+      );
+      final state =
+          AppState(fan: fan, system: FakeSystemIntegration());
+      state.init();
+      async.flushMicrotasks();
+      fan.emit();
+      async.flushMicrotasks();
+      state.selectProfile('balanced');
+      async.flushMicrotasks();
+      expect(fan.speeds['cpu'], 50);
+
+      fan.sensors = const [];
+      fan.emit();
+      async.flushMicrotasks();
+      expect(fan.resetCalls, contains('cpu'));
+      state.dispose();
+    });
+  });
+
+  test('boost restores the previous mode instead of going auto', () {
+    fakeAsync((async) {
+      final fan = FakeFanController(fans: [_cpu]);
+      final state =
+          AppState(fan: fan, system: FakeSystemIntegration());
+      state.init();
+      async.flushMicrotasks();
+      fan.emit();
+      async.flushMicrotasks();
+
+      state.selectFixed();
+      state.setSpeed('cpu', 30);
+      async.flushMicrotasks();
+
+      state.startBoost();
+      async.flushMicrotasks();
+      expect(fan.speeds['cpu'], 100);
+
+      state.cancelBoost();
+      async.flushMicrotasks();
+      expect(fan.speeds['cpu'], 30);
+      state.dispose();
+    });
+  });
+
+  test('mode, profile edits and fixed targets persist across restarts', () {
+    fakeAsync((async) {
+      final system = FakeSystemIntegration();
+      final fan = FakeFanController(fans: [_cpu]);
+
+      final first = AppState(fan: fan, system: system);
+      first.init();
+      async.flushMicrotasks();
+      fan.emit();
+      async.flushMicrotasks();
+      first.selectProfile('quiet');
+      async.flushMicrotasks();
+      first.updateProfile(
+        first.activeProfile!.copyWith(name: 'Very quiet'),
+      );
+      async.flushMicrotasks();
+      first.dispose();
+      async.flushMicrotasks();
+
+      expect(system.settingsJson, isNotNull);
+
+      final second = AppState(fan: fan, system: system);
+      second.init();
+      async.flushMicrotasks();
+      expect(second.fanMode, FanMode.profile);
+      expect(second.activeProfileId, 'quiet');
+      expect(second.activeProfile!.name, 'Very quiet');
+      second.dispose();
     });
   });
 

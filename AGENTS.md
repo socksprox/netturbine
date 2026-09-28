@@ -31,8 +31,8 @@ Keep it small:
 
 - System-tray presence (notification-area overflow — the "^" chevron); click reveals the app
 - "Start on startup" setting
-- Manual fan-speed slider override
-- Temporary boost button (e.g. "max speed for 15 min")
+- Fan control modes: Auto (firmware, read-only), Fixed (per-fan speed slider), and named temperature-curve profiles — Quiet/Balanced/Performance ship built-in, are editable, and can be duplicated into customs. Settings persist via `SystemIntegration.saveSettings`
+- Temporary boost button (e.g. "max speed for 15 min") — restores the previous mode afterward
 
 No dashboards, no sensor graphs beyond what's needed to label fans.
 

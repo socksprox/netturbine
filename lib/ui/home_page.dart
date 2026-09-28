@@ -4,6 +4,8 @@ import '../app/app_state.dart';
 import 'temp_page.dart';
 import 'widgets/boost_button.dart';
 import 'widgets/fan_card.dart';
+import 'widgets/mode_selector.dart';
+import 'widgets/profile_editor.dart';
 import 'widgets/segmented_selector.dart';
 import 'widgets/settings_section.dart';
 
@@ -117,6 +119,8 @@ class _FanTab extends StatelessWidget {
               ),
             ),
           ),
+        ModeSelector(state: state),
+        const SizedBox(height: 8),
         if (state.fans.isEmpty)
           Card(
             child: Padding(
@@ -132,6 +136,11 @@ class _FanTab extends StatelessWidget {
             FanCard(fan: fan, state: state),
             const SizedBox(height: 8),
           ],
+        if (state.fanMode == FanMode.profile &&
+            state.activeProfile != null) ...[
+          ProfileEditor(state: state, profile: state.activeProfile!),
+          const SizedBox(height: 8),
+        ],
         const SizedBox(height: 8),
         BoostButton(state: state),
         const SizedBox(height: 8),

@@ -6,7 +6,10 @@ import 'package:netturbine/api/system_integration.dart';
 /// In-memory FanController for tests. Never touches hardware, registry, or
 /// WMI. Call [emit] after mutating [fans] to push a snapshot.
 class FakeFanController implements FanController {
-  FakeFanController({this.fans = const [], this.capabilities = _all});
+  FakeFanController(
+      {this.fans = const [],
+      this.sensors = const [],
+      this.capabilities = _all});
 
   static const _all = FanCapabilities(canReadRpm: true, canSetSpeed: true);
 
@@ -20,7 +23,7 @@ class FakeFanController implements FanController {
   List<FanInfo> fans;
 
   @override
-  List<TempSensor> sensors = const [];
+  List<TempSensor> sensors;
 
   @override
   FanCapabilities capabilities;
@@ -81,6 +84,7 @@ class FakeSystemIntegration implements SystemIntegration {
   bool setStartupShouldThrow = false;
   int showWindowCalls = 0;
   int quitCalls = 0;
+  String? settingsJson;
 
   @override
   Future<bool> isLaunchAtStartupEnabled() async => launchAtStartup;
@@ -96,4 +100,10 @@ class FakeSystemIntegration implements SystemIntegration {
 
   @override
   Future<void> quitApp() async => quitCalls++;
+
+  @override
+  Future<String?> loadSettings() async => settingsJson;
+
+  @override
+  Future<void> saveSettings(String json) async => settingsJson = json;
 }
