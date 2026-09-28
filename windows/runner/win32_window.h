@@ -14,10 +14,6 @@ constexpr const wchar_t kWindowClassName[] = L"FLUTTER_RUNNER_WIN32_WINDOW";
 constexpr UINT kTrayCallbackMessage = WM_APP + 1;  // Shell_NotifyIcon callback
 constexpr UINT kShowWindowMessage = WM_APP + 2;    // "show" from 2nd instance
 
-// Tray context-menu command IDs.
-constexpr WPARAM kTrayMenuOpen = 1001;
-constexpr WPARAM kTrayMenuQuit = 1002;
-
 // A class abstraction for a high DPI-aware Win32 Window. Intended to be
 // inherited from by classes that wish to specialize with custom
 // rendering and input handling
@@ -108,9 +104,6 @@ class Win32Window {
   // Adds/removes the notification-area (tray) icon for this window.
   void SetupTrayIcon();
   void RemoveTrayIcon();
-
-  // Opens the tray context menu at the cursor position.
-  void ShowTrayMenu();
 
   bool quit_on_close_ = false;
 

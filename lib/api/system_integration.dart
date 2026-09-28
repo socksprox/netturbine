@@ -18,6 +18,6 @@ abstract class SystemIntegration {
   /// Brings the app window to the foreground.
   Future<void> showWindow();
 
-  /// Quits the app (same as the tray Quit menu item).
+  /// Quits the app (as opposed to hiding the window to the tray).
   Future<void> quitApp();
 }

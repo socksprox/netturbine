@@ -295,8 +295,8 @@ void Win32Window::Hide() {
   SetTimer(window_handle_, kFlyoutSlideTimerId, 15, nullptr);
 }
 
-// Notification-area icon ("^" overflow chevron). Left-click toggles the
-// window; right-click opens a popup menu whose commands arrive as WM_COMMAND.
+// Notification-area icon ("^" overflow chevron). Either mouse button toggles
+// the flyout window; quitting lives in the app's own settings UI.
 void Win32Window::SetupTrayIcon() {
   NOTIFYICONDATAW nid{};
   nid.cbSize = sizeof(nid);
@@ -320,24 +320,6 @@ void Win32Window::RemoveTrayIcon() {
   nid.hWnd = window_handle_;
   nid.uID = 1;
   Shell_NotifyIconW(NIM_DELETE, &nid);
-}
-
-void Win32Window::ShowTrayMenu() {
-  HMENU menu = CreatePopupMenu();
-  if (!menu) {
-    return;
-  }
-  AppendMenuW(menu, MF_STRING, kTrayMenuOpen, L"Open netturbine");
-  AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-  AppendMenuW(menu, MF_STRING, kTrayMenuQuit, L"Quit");
-
-  POINT pt;
-  GetCursorPos(&pt);
-  // Required so the menu dismisses when clicking elsewhere.
-  SetForegroundWindow(window_handle_);
-  TrackPopupMenu(menu, TPM_RIGHTBUTTON, pt.x, pt.y, 0, window_handle_,
-                 nullptr);
-  DestroyMenu(menu);
 }
 
 // static
@@ -367,17 +349,9 @@ Win32Window::MessageHandler(HWND hwnd,
                             LPARAM const lparam) noexcept {
   switch (message) {
     case WM_CLOSE:
-      // Tray app: the close button hides the window; quitting happens only
-      // via the tray menu's Quit item.
+      // Tray app: the close button hides the window; quitting happens via
+      // the Quit button in the app's settings UI ("quitApp" channel call).
       Hide();
-      return 0;
-
-    case WM_COMMAND:
-      if (wparam == kTrayMenuOpen) {
-        ShowAboveTray();
-      } else if (wparam == kTrayMenuQuit) {
-        DestroyWindow(window_handle_);  // -> WM_DESTROY -> PostQuitMessage
-      }
       return 0;
 
     case kShowWindowMessage:
@@ -385,7 +359,8 @@ Win32Window::MessageHandler(HWND hwnd,
       return 0;
 
     case kTrayCallbackMessage:
-      if (lparam == WM_LBUTTONUP || lparam == WM_LBUTTONDBLCLK) {
+      if (lparam == WM_LBUTTONUP || lparam == WM_LBUTTONDBLCLK ||
+          lparam == WM_RBUTTONUP || lparam == WM_RBUTTONDBLCLK) {
         if (IsWindowVisible(window_handle_)) {
           Hide();
         } else if (GetTickCount64() - last_blur_hide_tick_ > 400) {
@@ -393,8 +368,6 @@ Win32Window::MessageHandler(HWND hwnd,
           // hidden — that's the toggle-off gesture.
           ShowAboveTray();
         }
-      } else if (lparam == WM_RBUTTONUP) {
-        ShowTrayMenu();
       }
       return 0;
 
@@ -454,9 +427,8 @@ Win32Window::MessageHandler(HWND hwnd,
     case WM_ACTIVATE:
       if (LOWORD(wparam) == WA_INACTIVE) {
         // Flyout behavior: clicking anywhere else dismisses it. Only stamp
-        // the time when the window was actually visible — the tray menu
-        // briefly foregrounds the hidden window, and a stale stamp would
-        // swallow the user's next left-click.
+        // the time when the window was actually visible — a stale stamp
+        // would swallow the user's next tray click.
         if (IsWindowVisible(window_handle_)) {
           Hide();
           last_blur_hide_tick_ = GetTickCount64();

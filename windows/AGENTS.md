@@ -4,7 +4,7 @@ Native OS integration lives here. Keep the Flutter runner template as close to s
 
 ## Responsibilities
 
-- **Tray icon** — `Shell_NotifyIcon` in the runner (notification area — the "^" overflow chevron). Left-click toggles the Flutter window; right-click shows a context menu (Open / Quit). No third-party tray packages.
+- **Tray icon** — `Shell_NotifyIcon` in the runner (notification area — the "^" overflow chevron). Both left- and right-click toggle the Flutter window; quitting happens via the in-app Quit button (`quitApp` channel). No third-party tray packages.
 - **Start on startup** — `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` entry. HKCU only: toggling must never require admin.
 - **Single instance** — named mutex; a second launch signals the first to show its window.
 - **Window** — no taskbar entry (`WS_EX_TOOLWINDOW`), app starts hidden to tray unless launched with `--show`.
