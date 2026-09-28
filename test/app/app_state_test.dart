@@ -1,3 +1,5 @@
+import 'dart:convert';
+
 import 'package:fake_async/fake_async.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:netturbine/api/fan_controller.dart';
@@ -181,7 +183,46 @@ void main() {
     });
   });
 
-  test('curve falls back to firmware when the sensor goes missing', () {
+  test('curve snaps sub-spin duties to a clean stop', () {
+    fakeAsync((async) {
+      final system = FakeSystemIntegration()
+        ..settingsJson = jsonEncode({
+          'mode': 'profile',
+          'profile': 'lowcurve',
+          'profiles': [
+            {
+              'id': 'lowcurve',
+              'name': 'Low curve',
+              'sensorId': 'cpu',
+              'points': [
+                {'temp': 40, 'percent': 0},
+                {'temp': 60, 'percent': 10},
+              ],
+              'custom': true,
+            },
+          ],
+        });
+      final fan = FakeFanController(
+        fans: [_cpu],
+        sensors: const [
+          TempSensor(id: 'cpu', label: 'CPU', celsius: 50),
+        ],
+      );
+      final state = AppState(fan: fan, system: system);
+      state.init();
+      async.flushMicrotasks();
+      fan.emit();
+      async.flushMicrotasks();
+
+      // Interpolates to 5% — below the motor's start threshold, so the
+      // app writes a clean 0% rather than pulsing the fan.
+      expect(fan.speeds['cpu'], 0);
+      expect(state.manualTarget('cpu'), 0);
+      state.dispose();
+    });
+  });
+
+  test('curve falls back to firmware after sustained sensor loss', () {
     fakeAsync((async) {
       final fan = FakeFanController(
         fans: [_cpu],
@@ -198,10 +239,19 @@ void main() {
       state.selectProfile('balanced');
       async.flushMicrotasks();
       expect(fan.speeds['cpu'], 50);
+      fan.resetCalls.clear(); // startup auto-apply already reset once
 
       fan.sensors = const [];
+      // A single missing reading must not release the hold — transient
+      // poll failures would otherwise pulse the fans.
       fan.emit();
       async.flushMicrotasks();
+      expect(fan.resetCalls, isNot(contains('cpu')));
+
+      for (var i = 0; i < 3; i++) {
+        fan.emit();
+        async.flushMicrotasks();
+      }
       expect(fan.resetCalls, contains('cpu'));
       state.dispose();
     });

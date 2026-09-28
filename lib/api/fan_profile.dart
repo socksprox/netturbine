@@ -143,10 +143,12 @@ class FanProfile {
         sensorId: 'cpu',
         builtIn: true,
         points: const [
+          // Fans can't sustain <20% — 0% until it actually gets warm,
+          // then straight to a duty that holds rotation.
           CurvePoint(temp: 45, percent: 0),
-          CurvePoint(temp: 60, percent: 15),
-          CurvePoint(temp: 75, percent: 35),
-          CurvePoint(temp: 90, percent: 60),
+          CurvePoint(temp: 60, percent: 0),
+          CurvePoint(temp: 70, percent: 25),
+          CurvePoint(temp: 85, percent: 55),
           CurvePoint(temp: 95, percent: 100),
         ],
       );

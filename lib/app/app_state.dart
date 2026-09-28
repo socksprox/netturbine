@@ -32,6 +32,16 @@ class AppState extends ChangeNotifier {
   /// spamming writes on 1% wobble as the temperature jitters.
   static const _curveHysteresis = 2;
 
+  /// Below this duty the fans can't sustain rotation — the EC just pulses
+  /// the motor on and off. Tiny nonzero setpoints are treated as a clean
+  /// 0% (off) instead.
+  static const _minSpinPercent = 20;
+
+  /// Consecutive polls without a sensor reading tolerated before the
+  /// curve releases fans to firmware (~6s at the 2s poll interval).
+  /// Guards against transient `temps` failures pulsing the fans.
+  static const _sensorGraceTicks = 3;
+
   final FanController fan;
   final SystemIntegration system;
   StreamSubscription<List<FanInfo>>? _sub;
@@ -56,6 +66,7 @@ class AppState extends ChangeNotifier {
   bool _curveBusy = false;
   bool _curveHolding = false;
   int? _lastCurvePercent;
+  int _missingSensorTicks = 0;
 
   Timer? _boostTimer;
   Duration? _boostRemaining;
@@ -178,8 +189,13 @@ class AppState extends ChangeNotifier {
           ?.celsius;
       final target = profile.speedFor(celsius);
       if (target == null) {
-        if (_curveHolding) {
+        // Sensor reading unavailable — release to firmware rather than
+        // holding a stale setpoint, but only after several consecutive
+        // misses so a transient poll failure doesn't toggle the fans.
+        if (_curveHolding &&
+            ++_missingSensorTicks >= _sensorGraceTicks) {
           _curveHolding = false;
+          _missingSensorTicks = 0;
           _lastCurvePercent = null;
           for (final f in fans.where((f) => f.canControl)) {
             await fan.resetToAuto(f.id);
@@ -188,21 +204,25 @@ class AppState extends ChangeNotifier {
         }
         return;
       }
+      _missingSensorTicks = 0;
+      // A low nonzero duty just makes the fan pulse on and off — snap to
+      // a clean stop instead.
+      final effective = target < _minSpinPercent ? 0 : target;
       // Skip the write when the target barely moved — unless a
       // controllable fan fell back to auto (helper restart, firmware
       // reclaim), in which case re-assert the setpoint.
       final anyUnheld = fans.any((f) => f.canControl && f.isAuto);
       if (!anyUnheld &&
           _lastCurvePercent != null &&
-          (target - _lastCurvePercent!).abs() < _curveHysteresis) {
+          (effective - _lastCurvePercent!).abs() < _curveHysteresis) {
         return;
       }
       for (final f in fans.where((f) => f.canControl)) {
-        await fan.setSpeed(f.id, target);
-        _manualTargets[f.id] = target;
+        await fan.setSpeed(f.id, effective);
+        _manualTargets[f.id] = effective;
       }
       _curveHolding = true;
-      _lastCurvePercent = target;
+      _lastCurvePercent = effective;
       notifyListeners();
     } on FanControlException {
       backendError = true;
@@ -264,10 +284,14 @@ class AppState extends ChangeNotifier {
   // ------------------------------------------------------ manual mode
 
   Future<void> setSpeed(String fanId, int percent) async {
+    // Same floor as the curve: 1–19% just pulses the motor, write a
+    // clean 0 instead so the slider's displayed target stays honest.
+    final effective =
+        percent > 0 && percent < _minSpinPercent ? 0 : percent;
     try {
       backendError = false;
-      await fan.setSpeed(fanId, percent);
-      _manualTargets[fanId] = percent;
+      await fan.setSpeed(fanId, effective);
+      _manualTargets[fanId] = effective;
     } on FanControlException {
       backendError = true;
     }
