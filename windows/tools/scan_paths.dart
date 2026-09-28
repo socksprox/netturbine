@@ -57,9 +57,8 @@ String nameAt(List<int> b, int i) => String.fromCharCodes(b.sublist(i, i + 4));
   }
 }
 
-void main() {
-  final f = File(
-      'C:\\Users\\user\\Code\\netturbine\\windows\\tools\\acpi\\DSDT-00000002-0.bin');
+void main(List<String> args) {
+  final f = File(args[0]);
   final b = f.readAsBytesSync();
   final stack = <(int end, String name)>[]; // scope stack
   final watch = RegExp(r'FAN|FST|FSL|FIF|FPS|EC|_TMP|GFRM|SFRM|RFRM|RPM');

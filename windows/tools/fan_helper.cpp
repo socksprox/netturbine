@@ -75,8 +75,7 @@ class Ec {
     HANDLE f = CreateFileW(blobPath.c_str(), GENERIC_READ, FILE_SHARE_READ,
                            nullptr, OPEN_EXISTING, 0, nullptr);
     if (f == INVALID_HANDLE_VALUE) {
-      blobPath = L"C:\\Users\\user\\Code\\netturbine\\windows\\tools\\"
-                 L"pawnio_modules\\LpcACPIEC.bin";
+      blobPath = std::wstring(dir) + L"\\pawnio_modules\\LpcACPIEC.bin";
       f = CreateFileW(blobPath.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
                       OPEN_EXISTING, 0, nullptr);
       if (f == INVALID_HANDLE_VALUE) return Fail("LpcACPIEC.bin not found");
@@ -241,8 +240,7 @@ class CpuTemp {
     HANDLE f = CreateFileW(blobPath.c_str(), GENERIC_READ, FILE_SHARE_READ,
                            nullptr, OPEN_EXISTING, 0, nullptr);
     if (f == INVALID_HANDLE_VALUE) {
-      blobPath = L"C:\\Users\\user\\Code\\netturbine\\windows\\tools\\"
-                 L"pawnio_modules\\IntelMSR.bin";
+      blobPath = std::wstring(dir) + L"\\pawnio_modules\\IntelMSR.bin";
       f = CreateFileW(blobPath.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
                       OPEN_EXISTING, 0, nullptr);
       if (f == INVALID_HANDLE_VALUE) return false;

@@ -1,5 +1,5 @@
-$p = 'C:\Users\user\Code\netturbine\windows\tools\acpi_probe.exe'
-$o = 'C:\Users\user\Code\netturbine\probe_out.txt'
+$p = "$PSScriptRoot\acpi_probe.exe"
+$o = "$PSScriptRoot\probe_out.txt"
 Remove-Item $o -ErrorAction SilentlyContinue
 function Run-Probe() { & $p @args 2>&1 | Out-File -Append $o -Encoding ascii }
 

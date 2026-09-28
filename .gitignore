@@ -49,7 +49,24 @@ app.*.map.json
 .widget_preview/
 
 # windows/tools investigation artifacts (regenerable or transient)
-windows/tools/acpi/*.dsl        # iasl disassemblies — regenerate from the .bin dumps
+windows/tools/acpi/             # ACPI table dumps — machine-specific firmware data
 windows/tools/fan_helper_new.exe # swap_helper.ps1 staging binary
 windows/tools/acpica/           # ACPICA source tree (iasl.exe alone is kept)
 windows/tools/acpica*.zip
+windows/tools/*.zip
+windows/tools/*.obj
+windows/tools/*.exe
+!windows/tools/iasl.exe
+windows/tools/*_out.txt
+windows/tools/fh_console.txt
+windows/tools/ec_temp_scan.txt
+windows/tools/s_*.txt
+windows/tools/probe_out.txt
+
+# Machine-specific IDE settings and probe leftovers
+.vscode/
+/acpi/
+/acpi_probe.obj
+/probe_out.txt
+/ec_out.txt
+/fh_console.txt

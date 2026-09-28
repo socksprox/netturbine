@@ -1,4 +1,4 @@
-$t = 'C:\Users\user\Code\netturbine\windows\tools'
+$t = $PSScriptRoot
 $probe = "$t\ec_probe.exe"
 $msr = "$t\msr_probe.exe"
 

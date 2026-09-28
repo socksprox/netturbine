@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <vector>
 
 #define EC_DATA_PORT 0x62
@@ -126,11 +127,19 @@ int main(int argc, char** argv) {
   }
   g_pio = h;
 
-  // Load the signed EC module blob.
-  const wchar_t* blobPath = L"C:\\Users\\user\\Code\\netturbine\\windows\\"
-                            L"tools\\pawnio_modules\\LpcACPIEC.bin";
-  HANDLE f = CreateFileW(blobPath, GENERIC_READ, FILE_SHARE_READ, nullptr,
-                         OPEN_EXISTING, 0, nullptr);
+  // Load the signed EC module blob — next to the exe, or in pawnio_modules/.
+  wchar_t dir[MAX_PATH];
+  GetModuleFileNameW(nullptr, dir, MAX_PATH);
+  wchar_t* slash = wcsrchr(dir, L'\\');
+  if (slash) *slash = 0;
+  std::wstring blobPath = std::wstring(dir) + L"\\LpcACPIEC.bin";
+  HANDLE f = CreateFileW(blobPath.c_str(), GENERIC_READ, FILE_SHARE_READ,
+                         nullptr, OPEN_EXISTING, 0, nullptr);
+  if (f == INVALID_HANDLE_VALUE) {
+    blobPath = std::wstring(dir) + L"\\pawnio_modules\\LpcACPIEC.bin";
+    f = CreateFileW(blobPath.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                    OPEN_EXISTING, 0, nullptr);
+  }
   if (f == INVALID_HANDLE_VALUE) {
     fprintf(stderr, "cannot open blob: %lu\n", GetLastError());
     return 2;

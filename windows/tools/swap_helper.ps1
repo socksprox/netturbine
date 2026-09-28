@@ -1,4 +1,4 @@
-$t = 'C:\Users\user\Code\netturbine\windows\tools'
+$t = $PSScriptRoot
 $o = "$t\swap_out.txt"
 Remove-Item $o -ErrorAction SilentlyContinue
 Stop-Service NetturbineFanHelper -Force -ErrorAction SilentlyContinue

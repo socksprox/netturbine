@@ -1,5 +1,5 @@
-$p = 'C:\Users\user\Code\netturbine\windows\tools\ec_probe.exe'
-$o = 'C:\Users\user\Code\netturbine\ec_out.txt'
+$p = "$PSScriptRoot\ec_probe.exe"
+$o = "$PSScriptRoot\ec_out.txt"
 Remove-Item $o -ErrorAction SilentlyContinue
 function Log([string]$s) { $s | Out-File -Append $o -Encoding ascii }
 function Run-Probe() { & $p @args 2>&1 | Out-File -Append $o -Encoding ascii }

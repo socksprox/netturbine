@@ -1,4 +1,4 @@
-$out = 'C:\Users\user\Code\netturbine\acpi'
+$out = "$PSScriptRoot\acpi"
 New-Item -ItemType Directory -Force $out | Out-Null
 Get-ChildItem 'HKLM:\HARDWARE\ACPI' -Recurse |
   Where-Object { $_.ValueCount -gt 0 } |

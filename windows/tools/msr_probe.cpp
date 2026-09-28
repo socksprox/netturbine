@@ -1,6 +1,7 @@
 // msr_probe — print CPU package temperature via PawnIO IntelMSR module.
 #include <windows.h>
 #include <cstdio>
+#include <string>
 #include <vector>
 
 typedef HRESULT(STDAPICALLTYPE* pio_open_fn)(PHANDLE);
@@ -29,10 +30,18 @@ int main() {
   auto close = (pio_close_fn)GetProcAddress(lib, "pawnio_close");
   if (FAILED(open(&pio_)) || !pio_) { fprintf(stderr, "open failed\n"); return 2; }
 
-  const wchar_t* bp =
-      L"C:\\Users\\user\\Code\\netturbine\\windows\\tools\\pawnio_modules\\IntelMSR.bin";
-  HANDLE f = CreateFileW(bp, GENERIC_READ, FILE_SHARE_READ, nullptr,
+  wchar_t dir[MAX_PATH];
+  GetModuleFileNameW(nullptr, dir, MAX_PATH);
+  wchar_t* slash = wcsrchr(dir, L'\\');
+  if (slash) *slash = 0;
+  std::wstring bp = std::wstring(dir) + L"\\IntelMSR.bin";
+  HANDLE f = CreateFileW(bp.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
                          OPEN_EXISTING, 0, nullptr);
+  if (f == INVALID_HANDLE_VALUE) {
+    bp = std::wstring(dir) + L"\\pawnio_modules\\IntelMSR.bin";
+    f = CreateFileW(bp.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                    OPEN_EXISTING, 0, nullptr);
+  }
   if (f == INVALID_HANDLE_VALUE) { fprintf(stderr, "no blob\n"); return 2; }
   DWORD sz = GetFileSize(f, nullptr);
   std::vector<BYTE> blob(sz);
