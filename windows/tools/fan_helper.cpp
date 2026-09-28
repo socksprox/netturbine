@@ -12,6 +12,7 @@
 //   set <fan> <pct>     -> "ok"                (holds fan at pct)
 //   auto <fan>          -> "ok"                (firmware control)
 //   temp                -> "ok <celsius>"      (CPU package temp)
+//   temps               -> "ok L=c [L=c ...]"  (all temp sensors; '_' = space)
 //   anything else       -> "err <msg>"
 //
 // Modes:
@@ -21,6 +22,7 @@
 //   (no args, SCM-launched)   — service entry point
 
 #include <windows.h>
+#include <winioctl.h>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -119,6 +121,12 @@ class Ec {
     ULONG64 hold = 0;
     if (RawRead(kFans[fan].hold, &hold)) return -1;
     return RawWrite(kFans[fan].hold, hold & ~kHoldBit);
+  }
+
+  // Read an arbitrary EC RAM register. Used for the thermal-sensor block.
+  int ReadReg(ULONG64 addr, ULONG64* v) {
+    Lock lock(mutex_);
+    return RawRead(addr, v);
   }
 
   // Returns 1 when the manual-hold bit is set, 0 for firmware control,
@@ -280,6 +288,43 @@ class CpuTemp {
   int tjMax_ = 100;
 };
 
+// ------------------------------------------------------------- SSD temp
+
+// NVMe composite temperature via StorageDeviceTemperatureProperty.
+// Returns Celsius, or -1 when unavailable. Works for any storage device
+// type, not just NVMe — the driver stack fills it in.
+static int SsdTemp(int drive) {
+  wchar_t path[32];
+  swprintf_s(path, L"\\\\.\\PhysicalDrive%d", drive);
+  // No access rights needed — the query goes through the storage stack.
+  HANDLE h = CreateFileW(path, 0, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                         OPEN_EXISTING, 0, nullptr);
+  if (h == INVALID_HANDLE_VALUE) return -1;
+
+  STORAGE_PROPERTY_QUERY q{};
+  q.PropertyId = StorageDeviceTemperatureProperty;
+  q.QueryType = PropertyStandardQuery;
+  BYTE buf[512] = {};
+  DWORD ret = 0;
+  int temp = -1;
+  if (DeviceIoControl(h, IOCTL_STORAGE_QUERY_PROPERTY, &q, sizeof(q), buf,
+                      sizeof(buf), &ret, nullptr)) {
+    // Response: STORAGE_TEMPERATURE_DATA_DESCRIPTOR + STORAGE_TEMPERATURE_INFO
+    // entries; Temperature is a signed short in Celsius, 0x8000 = not reported.
+    auto* hdr = reinterpret_cast<STORAGE_TEMPERATURE_DATA_DESCRIPTOR*>(buf);
+    if (ret >= sizeof(STORAGE_TEMPERATURE_DATA_DESCRIPTOR) &&
+        hdr->InfoCount >= 1) {
+      SHORT t = hdr->TemperatureInfo[0].Temperature;
+      if (t != (SHORT)STORAGE_TEMPERATURE_VALUE_NOT_REPORTED && t > 0 &&
+          t < 150) {
+        temp = t;
+      }
+    }
+  }
+  CloseHandle(h);
+  return temp;
+}
+
 // ------------------------------------------------------- pipe server layer
 
 static Ec g_ec;
@@ -327,6 +372,34 @@ static std::string Handle(const std::string& line) {
       return buf;
     }
     return "err sensor";
+  }
+  // "temps" -> "ok <label>=<celsius> [<label>=<celsius> ...]"
+  // EC thermal-sensor block THS0..THSF lives at 0xA8..0xB7 (ECMB maps there);
+  // entries reading 0x00 or >= 0x80 are unpopulated slots.
+  if (!strcmp(cmd, "temps")) {
+    std::string out = "ok";
+    int c = g_temp.Read();
+    if (c >= 0) out += " CPU=" + std::to_string(c);
+    for (int i = 0; i < 16; i++) {
+      ULONG64 v = 0;
+      if (g_ec.ReadReg(0xA8 + i, &v) == 0 && v >= 1 && v < 0x80) {
+        char buf[24];
+        sprintf_s(buf, " Zone_%d=%llu", i, v);
+        out += buf;
+      }
+    }
+    for (int d = 0; d < 8; d++) {
+      int t = SsdTemp(d);
+      if (t > 0) {
+        char buf[24];
+        if (d == 0)
+          sprintf_s(buf, " SSD=%d", t);
+        else
+          sprintf_s(buf, " SSD_%d=%d", d, t);
+        out += buf;
+      }
+    }
+    return out;
   }
   return "err badcmd";
 }

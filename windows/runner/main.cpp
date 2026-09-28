@@ -20,9 +20,12 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE prev,
   ::CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
 
   // Single instance: if another copy is running, ask it to show its window
-  // and exit.
-  HANDLE mutex =
-      CreateMutexW(nullptr, TRUE, L"Local\\netturbine-single-instance");
+  // and exit. Skipped in debug builds — `flutter run` needs the child process
+  // to stay alive or the launch fails, and running multiple dev copies is
+  // often useful.
+  HANDLE mutex = nullptr;
+#ifndef _DEBUG
+  mutex = CreateMutexW(nullptr, TRUE, L"Local\\netturbine-single-instance");
   if (GetLastError() == ERROR_ALREADY_EXISTS) {
     if (HWND existing = FindWindowW(kWindowClassName, nullptr)) {
       PostMessageW(existing, kShowWindowMessage, 0, 0);
@@ -31,14 +34,21 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE prev,
     ::CoUninitialize();
     return EXIT_SUCCESS;
   }
+#endif
 
   flutter::DartProject project(L"data");
 
   std::vector<std::string> command_line_arguments =
       GetCommandLineArguments();
+  // Debug builds always show the window — `flutter run` passes no --show and
+  // a hidden window looks like a failed launch.
+#ifdef _DEBUG
+  const bool start_visible = true;
+#else
   const bool start_visible =
       std::find(command_line_arguments.begin(), command_line_arguments.end(),
                 "--show") != command_line_arguments.end();
+#endif
 
   project.set_dart_entrypoint_arguments(std::move(command_line_arguments));
 

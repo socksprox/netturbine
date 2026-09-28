@@ -2,6 +2,7 @@
 
 #include <flutter/standard_method_codec.h>
 
+#include <algorithm>
 #include <optional>
 #include <string>
 
@@ -256,15 +257,34 @@ void FlutterWindow::HandleFanCall(
       fans.push_back(flutter::EncodableValue(fan));
     }
     flutter::EncodableList temps;
-    int celsius = 0;
-    if (up && PipeRequest("temp", &reply) && PipeOk(reply, &celsius)) {
-      flutter::EncodableMap sensor{
-          {flutter::EncodableValue("id"), flutter::EncodableValue("cpu")},
-          {flutter::EncodableValue("label"), flutter::EncodableValue("CPU")},
-          {flutter::EncodableValue("celsius"),
-           flutter::EncodableValue(celsius)},
-      };
-      temps.push_back(flutter::EncodableValue(sensor));
+    if (up && PipeRequest("temps", &reply) &&
+        reply.rfind("ok", 0) == 0) {
+      // "ok <label>=<celsius> [<label>=<celsius> ...]" — '_' in labels is a
+      // space placeholder.
+      size_t pos = 2;
+      while (pos < reply.size()) {
+        while (pos < reply.size() && reply[pos] == ' ') pos++;
+        size_t end = reply.find(' ', pos);
+        if (end == std::string::npos) end = reply.size();
+        std::string tok = reply.substr(pos, end - pos);
+        pos = end;
+        auto eq = tok.find('=');
+        if (eq == std::string::npos || eq == 0) continue;
+        std::string label = tok.substr(0, eq);
+        std::replace(label.begin(), label.end(), '_', ' ');
+        int celsius = atoi(tok.c_str() + eq + 1);
+        std::string id = tok.substr(0, eq);
+        std::transform(id.begin(), id.end(), id.begin(),
+                       [](unsigned char c) { return (char)tolower(c); });
+        flutter::EncodableMap sensor{
+            {flutter::EncodableValue("id"), flutter::EncodableValue(id)},
+            {flutter::EncodableValue("label"),
+             flutter::EncodableValue(label)},
+            {flutter::EncodableValue("celsius"),
+             flutter::EncodableValue(celsius)},
+        };
+        temps.push_back(flutter::EncodableValue(sensor));
+      }
     }
     flutter::EncodableMap payload{
         {flutter::EncodableValue("capabilities"),
