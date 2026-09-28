@@ -42,11 +42,13 @@ void main() {
       async.flushMicrotasks();
       expect(fan.speeds['cpu'], 100);
       expect(state.isBoosting, isTrue);
+      expect(state.manualTarget('cpu'), 100);
 
       async.elapse(AppState.boostDuration);
       async.flushMicrotasks();
       expect(state.isBoosting, isFalse);
       expect(fan.resetCalls, contains('cpu'));
+      expect(state.manualTarget('cpu'), isNull);
       state.dispose();
     });
   });
@@ -67,6 +69,43 @@ void main() {
       async.flushMicrotasks();
       expect(state.isBoosting, isFalse);
       expect(fan.resetCalls, contains('cpu'));
+      state.dispose();
+    });
+  });
+
+  test('setSpeed records the manual target; resetToAuto clears it', () {
+    fakeAsync((async) {
+      final fan = FakeFanController(fans: [_cpu]);
+      final state =
+          AppState(fan: fan, system: FakeSystemIntegration());
+      state.init();
+      async.flushMicrotasks();
+      fan.emit();
+      async.flushMicrotasks();
+
+      state.setSpeed('cpu', 25);
+      async.flushMicrotasks();
+      expect(state.manualTarget('cpu'), 25);
+
+      state.resetToAuto('cpu');
+      async.flushMicrotasks();
+      expect(state.manualTarget('cpu'), isNull);
+      state.dispose();
+    });
+  });
+
+  test('a failed setSpeed does not record a manual target', () {
+    fakeAsync((async) {
+      final fan = FakeFanController(fans: [_cpu])..throwOnControl = true;
+      final state =
+          AppState(fan: fan, system: FakeSystemIntegration());
+      state.init();
+      async.flushMicrotasks();
+
+      state.setSpeed('cpu', 25);
+      async.flushMicrotasks();
+      expect(state.manualTarget('cpu'), isNull);
+      expect(state.backendError, isTrue);
       state.dispose();
     });
   });

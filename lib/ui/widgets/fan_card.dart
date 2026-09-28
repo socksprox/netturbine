@@ -21,7 +21,13 @@ class _FanCardState extends State<FanCard> {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final fan = widget.fan;
-    final current = _dragValue ?? (fan.speedPercent ?? 0).toDouble();
+    // The slider is a setpoint control: bind it to the requested speed,
+    // not speedPercent. The measured duty ramps toward the setpoint over
+    // seconds (and firmware can clamp it), so showing it here makes the
+    // slider appear to bounce back right after release.
+    final target = fan.isAuto ? null : widget.state.manualTarget(fan.id);
+    final current =
+        _dragValue ?? (target ?? fan.speedPercent ?? 0).toDouble();
 
     return Card(
       child: Padding(
@@ -35,7 +41,11 @@ class _FanCardState extends State<FanCard> {
                   child: Text(fan.label, style: theme.textTheme.titleMedium),
                 ),
                 Text(
-                  fan.rpm != null ? '${fan.rpm} RPM' : '— RPM',
+                  fan.rpm != null
+                      ? '${fan.rpm} RPM'
+                      : fan.speedPercent != null
+                          ? 'at ${fan.speedPercent}%'
+                          : '— RPM',
                   style: theme.textTheme.bodySmall,
                 ),
               ],

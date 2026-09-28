@@ -23,6 +23,12 @@ class AppState extends ChangeNotifier {
   bool launchAtStartup = false;
   bool backendError = false;
 
+  /// Last speed requested per fan via setSpeed/boost, valid while that fan
+  /// reports manual mode. `FanInfo.speedPercent` is the measured duty —
+  /// firmware ramps toward the setpoint over seconds and can clamp it — so
+  /// the UI binds its slider to this target instead.
+  final _manualTargets = <String, int>{};
+
   Timer? _boostTimer;
   Duration? _boostRemaining;
 
@@ -44,10 +50,15 @@ class AppState extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// Last requested manual speed for [fanId], or null when that fan is on
+  /// automatic control or no override has been made this session.
+  int? manualTarget(String fanId) => _manualTargets[fanId];
+
   Future<void> setSpeed(String fanId, int percent) async {
     try {
       backendError = false;
       await fan.setSpeed(fanId, percent);
+      _manualTargets[fanId] = percent;
     } on FanControlException {
       backendError = true;
     }
@@ -58,6 +69,7 @@ class AppState extends ChangeNotifier {
     try {
       backendError = false;
       await fan.resetToAuto(fanId);
+      _manualTargets.remove(fanId);
     } on FanControlException {
       backendError = true;
     }
@@ -72,6 +84,7 @@ class AppState extends ChangeNotifier {
       backendError = false;
       for (final f in fans.where((f) => f.canControl)) {
         await fan.setSpeed(f.id, 100);
+        _manualTargets[f.id] = 100;
       }
       _boostRemaining = duration;
       _boostTimer = Timer.periodic(_boostTick, (_) => _tickBoost());
@@ -100,6 +113,7 @@ class AppState extends ChangeNotifier {
     _boostTimer?.cancel();
     _boostTimer = null;
     _boostRemaining = null;
+    _manualTargets.clear();
     try {
       for (final f in fans.where((f) => f.canControl)) {
         await fan.resetToAuto(f.id);
