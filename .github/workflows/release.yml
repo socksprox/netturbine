@@ -1,0 +1,68 @@
+name: Release
+
+# Manual trigger only: Actions -> Release -> Run workflow.
+# Builds the Windows installer and publishes it as a GitHub Release
+# tagged v<version> (version read from pubspec.yaml).
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write # needed to create releases and upload assets
+
+concurrency:
+  group: release
+
+jobs:
+  release:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - run: flutter pub get
+
+      - run: flutter analyze
+
+      - run: flutter test
+
+      # fan_helper.exe is gitignored (windows/tools/*.exe) — CI compiles it
+      # from source. advapi32 is needed for the SCM service APIs.
+      - uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Build fan helper
+        working-directory: windows/tools
+        shell: cmd
+        run: cl /nologo /EHsc /O2 fan_helper.cpp /link advapi32.lib
+
+      # Builds the Release bundle, generates + patches the Inno Setup
+      # script, auto-fetches ISCC via inno_bundle, and drops
+      # dist/Netturbine-<version>-x64.exe.
+      - name: Build installer
+        run: dart run run_build.dart
+
+      - name: Publish GitHub release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $version = (Select-String -Path pubspec.yaml `
+            -Pattern '^version:\s*([0-9]+\.[0-9]+\.[0-9]+)').Matches.Groups[1].Value
+          if (-not $version) { throw 'could not read version from pubspec.yaml' }
+          $tag = "v$version"
+
+          $installer = Get-ChildItem 'dist\*.exe' | Select-Object -First 1
+          if (-not $installer) { throw 'no installer found in dist/' }
+
+          if (gh release view $tag 2>$null) {
+            gh release upload $tag $installer.FullName --clobber
+          } else {
+            gh release create $tag $installer.FullName `
+              --target ${{ github.sha }} `
+              --title "Netturbine $tag" `
+              --generate-notes
+          }
