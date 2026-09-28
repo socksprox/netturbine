@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 
 import '../../api/fan_profile.dart';
 import '../../app/app_state.dart';
+import 'flyout_select.dart';
 
 /// Curve editor for the active profile: name, driving sensor, and the
 /// point list ("at X°C → Y%"). Shown when [FanMode.profile] is selected.
@@ -71,6 +72,8 @@ class _ProfileEditorState extends State<ProfileEditor> {
     _update(points: points);
   }
 
+  void _updateSensor(String id) => _update(sensorId: id);
+
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
@@ -105,22 +108,15 @@ class _ProfileEditorState extends State<ProfileEditor> {
                   Text('No temperature data',
                       style: theme.textTheme.bodySmall)
                 else
-                  DropdownButton<String>(
-                    value: sensors.any((s) => s.id == profile.sensorId)
-                        ? profile.sensorId
-                        : null,
-                    hint: Text(profile.sensorId,
-                        style: theme.textTheme.bodySmall),
-                    underline: const SizedBox.shrink(),
-                    isDense: true,
+                  NtSelect<String>(
+                    value: profile.sensorId,
+                    dense: true,
+                    placeholder: profile.sensorId,
                     items: [
                       for (final s in sensors)
-                        DropdownMenuItem(
-                            value: s.id, child: Text(s.label)),
+                        NtSelectItem(value: s.id, label: s.label),
                     ],
-                    onChanged: (v) {
-                      if (v != null) _update(sensorId: v);
-                    },
+                    onChanged: _updateSensor,
                   ),
               ],
             ),
@@ -196,21 +192,18 @@ class _PointRow extends StatelessWidget {
         children: [
           Text('at', style: theme.textTheme.bodySmall),
           const SizedBox(width: 4),
-          DropdownButton<int>(
+          NtSelect<int>(
             value: point.temp,
-            underline: const SizedBox.shrink(),
-            isDense: true,
+            dense: true,
+            minMenuWidth: 72,
             items: [
               for (final t in tempSteps)
-                DropdownMenuItem(value: t, child: Text('$t')),
+                NtSelectItem(value: t, label: '$t'),
             ],
-            onChanged: (v) {
-              if (v != null) {
-                onChanged(
-                    CurvePoint(temp: v, percent: point.percent));
-              }
-            },
+            onChanged: (v) =>
+                onChanged(CurvePoint(temp: v, percent: point.percent)),
           ),
+          const SizedBox(width: 4),
           Text('°C →', style: theme.textTheme.bodySmall),
           const Spacer(),
           _StepButton(
@@ -254,6 +247,8 @@ class _StepButton extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final dark = theme.brightness == Brightness.dark;
     return SizedBox(
       width: 26,
       height: 26,
@@ -262,6 +257,16 @@ class _StepButton extends StatelessWidget {
         padding: EdgeInsets.zero,
         visualDensity: VisualDensity.compact,
         onPressed: onPressed,
+        style: IconButton.styleFrom(
+          splashFactory: NoSplash.splashFactory,
+          shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(4)),
+          foregroundColor: theme.colorScheme.onSurface,
+          disabledForegroundColor: theme.hintColor,
+          hoverColor: dark
+              ? Colors.white.withValues(alpha: 0.06)
+              : Colors.black.withValues(alpha: 0.05),
+        ),
       ),
     );
   }
