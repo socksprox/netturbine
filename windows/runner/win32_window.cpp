@@ -41,6 +41,14 @@ void ApplyFlyoutChrome(HWND hwnd) {
   DwmExtendFrameIntoClientArea(hwnd, &margins);
 }
 
+// Flyout slide: the window eases 16px toward/away from the taskbar edge over
+// ~140ms on show and hide. Timer + SetWindowPos instead of AnimateWindow so
+// the Flutter surface stays live — AnimateWindow snapshots the window and
+// hardware-presented child content can paint blank during the capture.
+constexpr UINT_PTR kFlyoutSlideTimerId = 1;
+constexpr int kFlyoutSlideOffset = 16;  // px the flyout travels
+constexpr double kFlyoutSlideMs = 140.0;
+
 /// Registry key for app theme preference.
 ///
 /// A value of 0 indicates apps should use dark mode. A non-zero or missing
@@ -220,13 +228,71 @@ void Win32Window::ShowAboveTray() {
       y, work.top + kMargin,
       std::max<int>(work.top + kMargin, work.bottom - h - kMargin));
 
-  SetWindowPos(window_handle_, HWND_TOPMOST, x, y, w, h,
+  KillTimer(window_handle_, kFlyoutSlideTimerId);
+  flyout_hiding_ = false;
+
+  // Slide direction: the flyout emerges from (and later dismisses into) the
+  // taskbar edge.
+  int dx = 0;
+  int dy = 0;
+  if (work.bottom < mon.bottom) {
+    dy = kFlyoutSlideOffset;
+  } else if (work.top > mon.top) {
+    dy = -kFlyoutSlideOffset;
+  } else if (work.left > mon.left) {
+    dx = -kFlyoutSlideOffset;
+  } else {
+    dx = kFlyoutSlideOffset;
+  }
+  flyout_dismiss_dx_ = dx;
+  flyout_dismiss_dy_ = dy;
+
+  const bool was_visible = IsWindowVisible(window_handle_) != FALSE;
+  int from_x = x;
+  int from_y = y;
+  if (was_visible) {
+    // Already showing (e.g. "Open" while visible): glide from wherever it is.
+    RECT cur{};
+    GetWindowRect(window_handle_, &cur);
+    from_x = cur.left;
+    from_y = cur.top;
+  } else {
+    from_x = x + dx;
+    from_y = y + dy;
+  }
+
+  SetWindowPos(window_handle_, HWND_TOPMOST, from_x, from_y, w, h,
                SWP_SHOWWINDOW | SWP_FRAMECHANGED);
   SetForegroundWindow(window_handle_);
+  if (from_x != x || from_y != y) {
+    flyout_anim_from_x_ = from_x;
+    flyout_anim_from_y_ = from_y;
+    flyout_anim_target_x_ = x;
+    flyout_anim_target_y_ = y;
+    flyout_anim_start_ = GetTickCount64();
+    SetTimer(window_handle_, kFlyoutSlideTimerId, 15, nullptr);
+  }
 }
 
 void Win32Window::Hide() {
-  ShowWindow(window_handle_, SW_HIDE);
+  if (!window_handle_) {
+    return;
+  }
+  KillTimer(window_handle_, kFlyoutSlideTimerId);
+  if (!IsWindowVisible(window_handle_)) {
+    flyout_hiding_ = false;
+    return;
+  }
+  // Slide back toward the taskbar edge, then SW_HIDE on the last timer tick.
+  RECT rect{};
+  GetWindowRect(window_handle_, &rect);
+  flyout_anim_from_x_ = rect.left;
+  flyout_anim_from_y_ = rect.top;
+  flyout_anim_target_x_ = rect.left + flyout_dismiss_dx_;
+  flyout_anim_target_y_ = rect.top + flyout_dismiss_dy_;
+  flyout_anim_start_ = GetTickCount64();
+  flyout_hiding_ = true;
+  SetTimer(window_handle_, kFlyoutSlideTimerId, 15, nullptr);
 }
 
 // Notification-area icon ("^" overflow chevron). Left-click toggles the
@@ -238,8 +304,12 @@ void Win32Window::SetupTrayIcon() {
   nid.uID = 1;
   nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
   nid.uCallbackMessage = kTrayCallbackMessage;
-  nid.hIcon =
-      LoadIcon(GetModuleHandle(nullptr), MAKEINTRESOURCE(IDI_APP_ICON));
+  // LoadImage at the small-icon metrics picks the 16/20/24px entry from
+  // app_icon.ico; LoadIcon would hand back a downscaled 32px image.
+  nid.hIcon = static_cast<HICON>(LoadImage(
+      GetModuleHandle(nullptr), MAKEINTRESOURCE(IDI_APP_ICON), IMAGE_ICON,
+      GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON),
+      LR_DEFAULTCOLOR));
   wcscpy_s(nid.szTip, L"netturbine");
   Shell_NotifyIconW(NIM_ADD, &nid);
 }
@@ -335,6 +405,31 @@ Win32Window::MessageHandler(HWND hwnd,
         PostQuitMessage(0);
       }
       return 0;
+
+    case WM_TIMER:
+      if (wparam == kFlyoutSlideTimerId) {
+        const double t = std::min(
+            1.0, static_cast<double>(GetTickCount64() - flyout_anim_start_) /
+                     kFlyoutSlideMs);
+        const double e = 1.0 - (1.0 - t) * (1.0 - t) * (1.0 - t);  // ease-out
+        const int x =
+            flyout_anim_from_x_ +
+            static_cast<int>((flyout_anim_target_x_ - flyout_anim_from_x_) * e);
+        const int y =
+            flyout_anim_from_y_ +
+            static_cast<int>((flyout_anim_target_y_ - flyout_anim_from_y_) * e);
+        SetWindowPos(window_handle_, HWND_TOPMOST, x, y, 0, 0,
+                     SWP_NOSIZE | SWP_NOACTIVATE);
+        if (t >= 1.0) {
+          KillTimer(window_handle_, kFlyoutSlideTimerId);
+          if (flyout_hiding_) {
+            flyout_hiding_ = false;
+            ShowWindow(window_handle_, SW_HIDE);
+          }
+        }
+        return 0;
+      }
+      break;
 
     case WM_DPICHANGED: {
       auto newRectSize = reinterpret_cast<RECT*>(lparam);

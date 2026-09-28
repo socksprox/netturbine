@@ -118,6 +118,21 @@ class Win32Window {
   // causes the blur would otherwise reopen the flyout a moment later.
   ULONGLONG last_blur_hide_tick_ = 0;
 
+  // Flyout slide animation state (driven by a WM_TIMER on the window).
+  ULONGLONG flyout_anim_start_ = 0;
+  int flyout_anim_from_x_ = 0;
+  int flyout_anim_from_y_ = 0;
+  int flyout_anim_target_x_ = 0;
+  int flyout_anim_target_y_ = 0;
+
+  // Offset toward the taskbar edge, remembered from the last show so dismiss
+  // slides back the same way even if the cursor has since moved elsewhere.
+  int flyout_dismiss_dx_ = 0;
+  int flyout_dismiss_dy_ = 0;
+
+  // True while the slide-out runs; the final timer tick calls SW_HIDE.
+  bool flyout_hiding_ = false;
+
   // window handle for top level window.
   HWND window_handle_ = nullptr;
 
