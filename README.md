@@ -1,8 +1,9 @@
 # netturbine
 
-Windows fan control from the system tray. A compact Windows 11-style flyout
-(built with Flutter desktop) on top of a small elevated helper service that
-talks to the embedded controller.
+Fan control for the **HP OmniBook 7 (17-dc0xxx)** from the Windows system
+tray. A compact Windows 11-style flyout (built with Flutter desktop) on top
+of a small elevated helper service that talks to the laptop's embedded
+controller.
 
 ## Features
 
