@@ -47,11 +47,9 @@ class Win32Window {
   // |Show| is called. Returns true if the window was created successfully.
   bool Create(const std::wstring& title, const Point& origin, const Size& size);
 
-  // Show the current window. Returns true if the window was successfully shown.
-  bool Show();
-
-  // Shows the window and brings it to the foreground.
-  void ShowAndFocus();
+  // Shows the borderless flyout window directly above the tray icon (anchored
+  // to the taskbar edge) and brings it to the foreground.
+  void ShowAboveTray();
 
   // Hides the window without closing it (tray behavior).
   void Hide();
@@ -115,6 +113,10 @@ class Win32Window {
   void ShowTrayMenu();
 
   bool quit_on_close_ = false;
+
+  // GetTickCount64() of the last blur-driven Hide(). The tray click that
+  // causes the blur would otherwise reopen the flyout a moment later.
+  ULONGLONG last_blur_hide_tick_ = 0;
 
   // window handle for top level window.
   HWND window_handle_ = nullptr;

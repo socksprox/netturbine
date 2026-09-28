@@ -32,6 +32,7 @@ migrate_working_dir/
 .pub/
 /build/
 /coverage/
+/dist/
 
 # Symbolication related
 app.*.symbols
@@ -46,3 +47,9 @@ app.*.map.json
 
 # Widget Preview related
 .widget_preview/
+
+# windows/tools investigation artifacts (regenerable or transient)
+windows/tools/acpi/*.dsl        # iasl disassemblies — regenerate from the .bin dumps
+windows/tools/fan_helper_new.exe # swap_helper.ps1 staging binary
+windows/tools/acpica/           # ACPICA source tree (iasl.exe alone is kept)
+windows/tools/acpica*.zip

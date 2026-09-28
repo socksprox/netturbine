@@ -1,5 +1,5 @@
 name: netturbine
-description: "A new Flutter project."
+description: "Windows fan control from the system tray."
 # The following line prevents the package from being accidentally published to
 # pub.dev using `flutter pub publish`. This is preferred for private packages.
 publish_to: 'none' # Remove this line if you wish to publish to pub.dev
@@ -42,6 +42,15 @@ dev_dependencies:
   # rules and activating additional ones.
   flutter_lints: ^6.0.0
   fake_async: ^1.3.3
+  inno_bundle: 0.12.0
+
+inno_bundle:
+  id: d00ddf03-d692-4c52-bee3-0a0dedc523d5
+  name: Netturbine
+  publisher: Netturbine
+  admin: auto
+  languages:
+    - English
 
 # For information on the generic Dart part of this file, see the
 # following page: https://dart.dev/tools/pub/pubspec

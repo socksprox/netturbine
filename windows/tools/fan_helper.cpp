@@ -380,11 +380,24 @@ static std::string Handle(const std::string& line) {
     std::string out = "ok";
     int c = g_temp.Read();
     if (c >= 0) out += " CPU=" + std::to_string(c);
+    // EC offsets 0xA8-0xB7 = mailbox THS0-THSF. Names 0-4 come from the
+    // DSDT's second Field(ECMB) block: CPUT/MSKT/AMBT/VDIN/PCHT.
+    // VDIN is the DC-input area thermistor per Insyde convention.
+    static const char* kThsName[16] = {"CPU_EC", "Skin",   "Ambient",
+                                       "DC-In",  "PCH",    nullptr,
+                                       nullptr,  nullptr,  nullptr,
+                                       nullptr,  nullptr,  nullptr,
+                                       nullptr,  nullptr,  nullptr,
+                                       nullptr};
     for (int i = 0; i < 16; i++) {
       ULONG64 v = 0;
       if (g_ec.ReadReg(0xA8 + i, &v) == 0 && v >= 1 && v < 0x80) {
         char buf[24];
-        sprintf_s(buf, " Zone_%d=%llu", i, v);
+        if (kThsName[i]) {
+          sprintf_s(buf, " %s=%llu", kThsName[i], v);
+        } else {
+          sprintf_s(buf, " Zone_%d=%llu", i, v);
+        }
         out += buf;
       }
     }

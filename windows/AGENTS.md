@@ -17,7 +17,7 @@ Native OS integration lives here. Keep the Flutter runner template as close to s
 - `ec_probe.exe` in the same dir is a standalone read/write probe for debugging.
 - User-mode `IOCTL_ACPI_EVAL_METHOD` does **not** work on this machine (interface rejects with ERROR_NOT_SUPPORTED) — don't retry that path; PawnIO is the mechanism.
 - No RPM telemetry — `speedPercent` only; `canReadRpm` is false.
-- **Temperatures**: CPU package via PawnIO `IntelMSR.bin` (`IA32_PACKAGE_THERM_STATUS` / `IA32_TEMPERATURE_TARGET`); EC thermal-sensor block `THS0`–`THSF` at EC offsets `0xA8`–`0xB7` (DSDT `ECMB` region) — entries of `0x00` or `≥0x80` are unpopulated and filtered out; exposed as "Zone N". Zone 0 tracks the CPU package. SSD/NVMe composite temp via `StorageDeviceTemperatureProperty` (`IOCTL_STORAGE_QUERY_PROPERTY` on `\\.\PhysicalDriveN`).
+- **Temperatures**: CPU package via PawnIO `IntelMSR.bin` (`IA32_PACKAGE_THERM_STATUS` / `IA32_TEMPERATURE_TARGET`); EC thermal-sensor block `THS0`–`THSF` at EC offsets `0xA8`–`0xB7` — entries of `0x00` or `≥0x80` are unpopulated and filtered out. Names come from the DSDT: `ECMB` is a SystemMemory mailbox at `0xFE802000`, where a second `Field(ECMB)` block aliases `THS0`–`THS4` as `CPUT`/`MSKT`/`AMBT`/`VDIN`/`PCHT` (CPU, skin, ambient, DC-in/VRM area, PCH); unaliased slots report as "Zone N". `THS0`/`THS1` back ACPI thermal zones `TZS0`/`TZS1` (`TZS0._PSL` lists processors). SSD/NVMe composite temp via `StorageDeviceTemperatureProperty` (`IOCTL_STORAGE_QUERY_PROPERTY` on `\\.\PhysicalDriveN`).
 
 ## Rules
 

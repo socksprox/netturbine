@@ -43,6 +43,7 @@ No dashboards, no sensor graphs beyond what's needed to label fans.
 - `flutter test`
 - `flutter run -d windows`
 - `flutter build windows`
+- `dart run run_build.dart` — release installer via Inno Setup → `dist/` (Windows only)
 
 ## General rules
 

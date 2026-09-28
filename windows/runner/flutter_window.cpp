@@ -168,7 +168,7 @@ bool FlutterWindow::OnCreate() {
 
   flutter_controller_->engine()->SetNextFrameCallback([&]() {
     if (start_visible_) {
-      this->Show();
+      this->ShowAboveTray();
     }
   });
 
@@ -205,7 +205,7 @@ void FlutterWindow::HandleSystemCall(
     }
     result->Success(flutter::EncodableValue(SetLaunchAtStartup(enabled)));
   } else if (name == "showWindow") {
-    ShowAndFocus();
+    ShowAboveTray();
     result->Success();
   } else if (name == "quitApp") {
     DestroyWindow(GetHandle());  // -> WM_DESTROY -> PostQuitMessage

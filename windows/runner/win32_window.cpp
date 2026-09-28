@@ -4,6 +4,8 @@
 #include <flutter_windows.h>
 #include <shellapi.h>
 
+#include <algorithm>
+
 #include "resource.h"
 
 namespace {
@@ -16,6 +18,28 @@ namespace {
 #ifndef DWMWA_USE_IMMERSIVE_DARK_MODE
 #define DWMWA_USE_IMMERSIVE_DARK_MODE 20
 #endif
+#ifndef DWMWA_WINDOW_CORNER_PREFERENCE
+#define DWMWA_WINDOW_CORNER_PREFERENCE 33
+#endif
+#ifndef DWMWA_BORDER_COLOR
+#define DWMWA_BORDER_COLOR 34
+#endif
+#ifndef DWMWA_COLOR_NONE
+#define DWMWA_COLOR_NONE 0xFFFFFFFE
+#endif
+
+// Borderless flyout chrome (Win11+): small rounded corners matching the UI's
+// 8px radius, no DWM border, frame extended into the client area.
+void ApplyFlyoutChrome(HWND hwnd) {
+  constexpr DWORD kCornerRoundSmall = 3;  // DWMWCP_ROUND_SMALL
+  DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE,
+                        &kCornerRoundSmall, sizeof(kCornerRoundSmall));
+  const COLORREF border_none = DWMWA_COLOR_NONE;
+  DwmSetWindowAttribute(hwnd, DWMWA_BORDER_COLOR, &border_none,
+                        sizeof(border_none));
+  const MARGINS margins{-1, -1, -1, -1};
+  DwmExtendFrameIntoClientArea(hwnd, &margins);
+}
 
 /// Registry key for app theme preference.
 ///
@@ -133,11 +157,11 @@ bool Win32Window::Create(const std::wstring& title,
   UINT dpi = FlutterDesktopGetDpiForMonitor(monitor);
   double scale_factor = dpi / 96.0;
 
-  // Tray app: WS_EX_TOOLWINDOW keeps the window out of the taskbar, and the
-  // style omits WS_THICKFRAME/WS_MAXIMIZEBOX so the window is fixed-size.
+  // Tray flyout: WS_POPUP leaves the window chromeless (no caption, borders,
+  // or close button), WS_EX_TOOLWINDOW keeps it out of the taskbar, and
+  // WS_EX_TOPMOST floats it above other windows.
   HWND window = CreateWindowEx(
-      WS_EX_TOOLWINDOW, window_class, title.c_str(),
-      WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
+      WS_EX_TOOLWINDOW | WS_EX_TOPMOST, window_class, title.c_str(), WS_POPUP,
       Scale(origin.x, scale_factor), Scale(origin.y, scale_factor),
       Scale(size.width, scale_factor), Scale(size.height, scale_factor),
       nullptr, nullptr, GetModuleHandle(nullptr), this);
@@ -147,18 +171,57 @@ bool Win32Window::Create(const std::wstring& title,
   }
 
   UpdateTheme(window);
+  ApplyFlyoutChrome(window);
   SetupTrayIcon();
 
   return OnCreate();
 }
 
-bool Win32Window::Show() {
-  return ShowWindow(window_handle_, SW_SHOWNORMAL);
-}
+// Shows the flyout on the taskbar edge of the monitor the cursor is on,
+// centered on the tray icon. With a bottom taskbar the flyout sits right
+// above the notification area; the work area already excludes the taskbar,
+// so rcWork edges are the taskbar edges on any taskbar orientation.
+void Win32Window::ShowAboveTray() {
+  if (!window_handle_) {
+    return;
+  }
+  POINT cursor{};
+  GetCursorPos(&cursor);
+  HMONITOR monitor = MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST);
+  MONITORINFO info{};
+  info.cbSize = sizeof(info);
+  GetMonitorInfo(monitor, &info);
+  const RECT work = info.rcWork;
+  const RECT mon = info.rcMonitor;
 
-void Win32Window::ShowAndFocus() {
-  ShowWindow(window_handle_, SW_SHOW);
-  ShowWindow(window_handle_, SW_RESTORE);
+  RECT rect{};
+  GetWindowRect(window_handle_, &rect);
+  const int w = rect.right - rect.left;
+  const int h = rect.bottom - rect.top;
+  constexpr int kMargin = 8;  // physical px gap between flyout and taskbar
+
+  int x;
+  int y;
+  if (work.bottom < mon.bottom) {
+    y = work.bottom - h - kMargin;  // taskbar at the bottom (default)
+    x = cursor.x - w / 2;
+  } else if (work.top > mon.top) {
+    y = work.top + kMargin;  // taskbar at the top
+    x = cursor.x - w / 2;
+  } else {
+    y = cursor.y - h / 2;  // taskbar docked left or right
+    x = work.left > mon.left ? work.left + kMargin
+                             : work.right - w - kMargin;
+  }
+  x = std::clamp<int>(
+      x, work.left + kMargin,
+      std::max<int>(work.left + kMargin, work.right - w - kMargin));
+  y = std::clamp<int>(
+      y, work.top + kMargin,
+      std::max<int>(work.top + kMargin, work.bottom - h - kMargin));
+
+  SetWindowPos(window_handle_, HWND_TOPMOST, x, y, w, h,
+               SWP_SHOWWINDOW | SWP_FRAMECHANGED);
   SetForegroundWindow(window_handle_);
 }
 
@@ -241,19 +304,25 @@ Win32Window::MessageHandler(HWND hwnd,
 
     case WM_COMMAND:
       if (wparam == kTrayMenuOpen) {
-        ShowAndFocus();
+        ShowAboveTray();
       } else if (wparam == kTrayMenuQuit) {
         DestroyWindow(window_handle_);  // -> WM_DESTROY -> PostQuitMessage
       }
       return 0;
 
     case kShowWindowMessage:
-      ShowAndFocus();
+      ShowAboveTray();
       return 0;
 
     case kTrayCallbackMessage:
       if (lparam == WM_LBUTTONUP || lparam == WM_LBUTTONDBLCLK) {
-        ShowAndFocus();
+        if (IsWindowVisible(window_handle_)) {
+          Hide();
+        } else if (GetTickCount64() - last_blur_hide_tick_ > 400) {
+          // If the flyout just blur-hid because of this very click, leave it
+          // hidden — that's the toggle-off gesture.
+          ShowAboveTray();
+        }
       } else if (lparam == WM_RBUTTONUP) {
         ShowTrayMenu();
       }
@@ -288,7 +357,16 @@ Win32Window::MessageHandler(HWND hwnd,
     }
 
     case WM_ACTIVATE:
-      if (child_content_ != nullptr) {
+      if (LOWORD(wparam) == WA_INACTIVE) {
+        // Flyout behavior: clicking anywhere else dismisses it. Only stamp
+        // the time when the window was actually visible — the tray menu
+        // briefly foregrounds the hidden window, and a stale stamp would
+        // swallow the user's next left-click.
+        if (IsWindowVisible(window_handle_)) {
+          Hide();
+          last_blur_hide_tick_ = GetTickCount64();
+        }
+      } else if (child_content_ != nullptr) {
         SetFocus(child_content_);
       }
       return 0;
