@@ -20,6 +20,7 @@ const _helperFiles = [
   'LpcACPIEC.bin',
   'LpcIO.bin',
   'IntelMSR.bin',
+  'AMDFamily17.bin',
 ];
 
 String? findInnoBundleIscc() {

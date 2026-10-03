@@ -7,6 +7,9 @@
 //   - ACPI embedded controller via the PawnIO LpcACPIEC module — validated
 //     on the HP OmniBook 7 (17-dc0xxx, Insyde BIOS). Only enabled when the
 //     system product name reports an OmniBook; never probed elsewhere.
+//   - AMD GPU via the Adrenalin driver's ADLX library (amdadlx64.dll),
+//     LoadLibrary'd at runtime. Skipped when no AMD GPU/driver with
+//     manual fan tuning is present.
 // Fans from all active backends share one index space.
 //
 // Serves named pipe \\.\pipe\netturbine_fan with a line-based protocol:
@@ -41,6 +44,16 @@
 #include <memory>
 #include <string>
 #include <vector>
+
+// ADLX SDK headers (github.com/GPUOpen-LibrariesAndSDKs/ADLX, vendored
+// under adlx/) — interface declarations only; the implementation lives
+// in the driver-installed amdadlx64.dll, resolved via LoadLibrary.
+#include "adlx/ADLX.h"                     // IADLXSystem, IADLXGPU(List), fns
+#include "adlx/IGPUTuning.h"               // IADLXGPUTuningServices
+#include "adlx/IGPUManualFanTuning.h"      // IADLXManualFanTuning(+1), states
+#include "adlx/IPerformanceMonitoring3.h"  // IADLXGPUMetrics3 (GPUFanDuty)
+
+using namespace adlx;
 
 typedef HRESULT(STDAPICALLTYPE* pawnio_open_fn)(PHANDLE);
 typedef HRESULT(STDAPICALLTYPE* pawnio_load_fn)(HANDLE, const UCHAR*, SIZE_T);
@@ -367,6 +380,23 @@ class SuperIoFans : public FanBackend {
       if (status == 0 || (status == 1 && mode != 0)) channels_.push_back(i);
     }
     if (channels_.empty()) return Fail("no fan channels");
+    // Board product name — chip channels map onto silkscreened fan
+    // headers differently per board; resolve the kBoards entry so
+    // FanLabel can report the real header names.
+    wchar_t product[128] = {};
+    DWORD size = sizeof(product);
+    if (RegGetValueW(HKEY_LOCAL_MACHINE,
+                     L"HARDWARE\\DESCRIPTION\\System\\BIOS",
+                     L"BaseBoardProduct", RRF_RT_REG_SZ, nullptr, product,
+                     &size) == ERROR_SUCCESS) {
+      boardProduct_ = product;
+      for (int i = 0; kBoards[i].match; i++) {
+        if (wcsstr(boardProduct_.c_str(), kBoards[i].match)) {
+          board_ = &kBoards[i];
+          break;
+        }
+      }
+    }
     return true;
   }
 
@@ -378,6 +408,9 @@ class SuperIoFans : public FanBackend {
     int i = channel >= 0 && channel < (int)channels_.size()
                 ? channels_[channel]
                 : channel;
+    if (board_ && i >= 0 && i < 7 && board_->labels[i]) {
+      return board_->labels[i];
+    }
     sprintf_s(label, "Fan_%d", i + 1);
     return label;
   }
@@ -472,6 +505,13 @@ class SuperIoFans : public FanBackend {
     bool newPwmOut;    // newer PWM-out map (NCT6796DR+)
     const TempReg* temps;
   };
+  // Per-board fan wiring: a BaseBoardProduct substring matched against
+  // the registry, plus the board's silkscreened header label for each
+  // chip channel (nullptr keeps the generic Fan_N fallback).
+  struct BoardDef {
+    const wchar_t* match;
+    const char* labels[7];
+  };
 
   // Hwmon registers are banked: high byte of the address selects the bank
   // (written to index 0x4E), low byte is the in-bank register.
@@ -489,6 +529,7 @@ class SuperIoFans : public FanBackend {
   static const TempReg kTemps679x[];
   static const TempReg kTemps6779[];
   static const ChipDef kChips[];
+  static const BoardDef kBoards[];
 
   bool Fail(const char* e) {
     strncpy_s(err_, e, _TRUNCATE);
@@ -616,6 +657,8 @@ class SuperIoFans : public FanBackend {
   const USHORT* pwmOut_ = nullptr;
   USHORT hwmon_ = 0;
   std::vector<int> channels_;  // exposed index -> chip channel
+  std::wstring boardProduct_;    // BaseBoardProduct registry value
+  const BoardDef* board_ = nullptr;  // resolved kBoards entry, if any
   bool saved_[7] = {};
   BYTE savedMode_[7] = {};
   BYTE savedPwm_[7] = {};
@@ -664,7 +707,455 @@ const SuperIoFans::ChipDef SuperIoFans::kChips[] = {
     {0xD8, 0x06, 0xFF, "nct6701d", 7, false, kTemps679x},
     {0, 0, 0, nullptr, 0, false, nullptr}};
 
+// Known-board header wiring. Each entry matches a BaseBoardProduct
+// substring and labels populated chip channels (index = chip channel
+// 0-6; nullptr keeps the generic Fan_N fallback). Verify against the
+// board's silkscreened headers before adding — wiring differs per board.
+const SuperIoFans::BoardDef SuperIoFans::kBoards[] = {
+    // MSI B450M PRO-VDH MAX (MS-7A38), NCT6795D: ch1 -> CPU_FAN1,
+    // ch2 -> SYS_FAN1, ch3 -> SYS_FAN2 (PUMP_FAN1 header unpopulated).
+    {L"MS-7A38", {nullptr, "CPU_fan", "System_fan_1", "System_fan_2",
+                  nullptr, nullptr, nullptr}},
+    {nullptr, {nullptr}}};
+
+// ---------------------------------------------------------- AMD GPU (ADLX)
+
+// AMD GPU fan control via the Adrenalin driver's ADLX library
+// (amdadlx64.dll). The DLL ships with the driver, so it is LoadLibrary'd
+// at runtime — systems without an AMD GPU/driver simply never activate
+// the backend. Interface model and call order follow the ADLX SDK
+// (headers vendored under adlx/, GPUOpen-LibrariesAndSDKs/ADLX) and
+// FanControl's ADLXControl (github.com/Rem0o/FanControl.ADLX):
+//   detect : IADLXSystem::GetGPUs + IADLXGPUTuningServices::
+//            IsSupportedManualFanTuning + GetManualFanTuning
+//   hold   : IADLXManualFanTuning::SetTargetFanSpeed (RPM) when the GPU
+//            supports it, else SetFanSpeed on every fan-tuning state +
+//            SetFanTuningStates (flattens the curve to one speed)
+//   auto   : re-apply the factory defaults (IADLXManualFanTuning1) or
+//            the init-time captured states — applying a states table
+//            also releases a target-speed hold
+//   retry  : ADLX_RESET_NEEDED on a write -> ResetToFactory once, retry
+// Telemetry comes from IADLXPerformanceMonitoringServices::
+// GetCurrentGPUMetrics — GPUFanSpeed = RPM, IADLXGPUMetrics3::GPUFanDuty
+// = live duty %, GPUTemperature/GPUHotspotTemperature feed "temps".
+class AdlxFans : public FanBackend {
+ public:
+  ~AdlxFans() { Shutdown(); }
+
+  bool Init() {
+    mutex_ = CreateMutexW(nullptr, FALSE, nullptr);
+    // The driver installs amdadlx64.dll into System32; restricting the
+    // search to it keeps a planted DLL next to the exe from loading —
+    // this process runs elevated as a service.
+    lib_ = LoadLibraryExW(ADLX_DLL_NAMEW, nullptr,
+                          LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (!lib_) return Fail("amdadlx64.dll not found");
+    auto init = (ADLXInitialize_Fn)GetProcAddress(lib_,
+                                                  ADLX_INIT_FUNCTION_NAME);
+    auto initLegacy = (ADLXInitialize_Fn)GetProcAddress(
+        lib_, ADLX_INIT_WITH_INCOMPATIBLE_DRIVER_FUNCTION_NAME);
+    terminate_ = (ADLXTerminate_Fn)GetProcAddress(
+        lib_, ADLX_TERMINATE_FUNCTION_NAME);
+    if (!init || !terminate_) return Fail("amdadlx64 exports");
+    IADLXSystem* sys = nullptr;
+    // Same call the SDK's ADLXHelper makes: compile-time full version,
+    // with the legacy-driver entry point as fallback.
+    ADLX_RESULT r = init(ADLX_FULL_VERSION, &sys);
+    if (ADLX_FAILED(r) && initLegacy) {
+      r = initLegacy(ADLX_FULL_VERSION, &sys);
+    }
+    if (ADLX_FAILED(r) || !sys) return Fail("ADLXInitialize");
+    system_ = sys;
+
+    IADLXGPUListPtr list;
+    if (ADLX_FAILED(system_->GetGPUs(&list)) || !list) {
+      return Fail("GetGPUs");
+    }
+    if (ADLX_FAILED(system_->GetGPUTuningServices(&tuning_)) || !tuning_) {
+      return Fail("GPUTuningServices");
+    }
+    system_->GetPerformanceMonitoringServices(&perf_);  // optional
+
+    for (adlx_uint i = list->Begin(); i < list->End(); i++) {
+      IADLXGPUPtr gpu;
+      if (ADLX_FAILED(list->At(i, &gpu)) || !gpu) continue;
+      adlx_bool sup = false;
+      if (ADLX_FAILED(tuning_->IsSupportedManualFanTuning(gpu, &sup)) ||
+          !sup) {
+        continue;
+      }
+      IADLXInterfacePtr ifc;
+      if (ADLX_FAILED(tuning_->GetManualFanTuning(gpu, &ifc)) || !ifc) {
+        continue;
+      }
+      IADLXManualFanTuningPtr mft(ifc);  // QueryInterface
+      if (!mft) continue;
+      GpuFan f;
+      f.gpu = gpu;
+      f.mft = mft;
+      f.mft1 = IADLXManualFanTuning1Ptr(mft);
+      adlx_bool b = false;
+      if (ADLX_SUCCEEDED(mft->IsSupportedZeroRPM(&b)) && b) {
+        f.zeroRpm = true;
+        adlx_bool st = false;
+        if (ADLX_SUCCEEDED(mft->GetZeroRPMState(&st))) f.zeroRpmBase = st;
+      }
+      // Preferred hold: a target RPM. FanControl only takes this path
+      // when both target and minimum fan speed are supported.
+      adlx_bool tgt = false, mins = false;
+      mft->IsSupportedTargetFanSpeed(&tgt);
+      mft->IsSupportedMinFanSpeed(&mins);
+      if (tgt && mins) {
+        ADLX_IntRange range = {};
+        if (ADLX_SUCCEEDED(mft->GetTargetFanSpeedRange(&range)) &&
+            range.maxValue > 0) {
+          f.targetMode = true;
+          f.targetMin = range.minValue;
+          f.targetMax = range.maxValue;
+        }
+      }
+      // Live copy of the fan-tuning states plus the (temp, speed)
+      // baseline SetAuto restores. Kept in target mode too — applying a
+      // states table is what releases a target-speed hold.
+      IADLXManualFanTuningStateListPtr states;
+      if (ADLX_SUCCEEDED(mft->GetFanTuningStates(&states)) && states) {
+        f.states = states;
+        for (adlx_uint k = states->Begin(); k < states->End(); k++) {
+          IADLXManualFanTuningStatePtr s;
+          if (ADLX_FAILED(states->At(k, &s)) || !s) continue;
+          adlx_int t = 0, v = 0;
+          s->GetTemperature(&t);
+          s->GetFanSpeed(&v);
+          f.baseline.push_back({(int)t, (int)v});
+        }
+      }
+      if (!f.targetMode && f.baseline.empty()) continue;
+      // Metrics support — RPM readout plus the max used for the percent
+      // fallback conversion.
+      if (perf_) {
+        IADLXGPUMetricsSupportPtr ms;
+        if (ADLX_SUCCEEDED(perf_->GetSupportedGPUMetrics(gpu, &ms)) && ms) {
+          adlx_bool fs = false;
+          if (ADLX_SUCCEEDED(ms->IsSupportedGPUFanSpeed(&fs)) && fs) {
+            f.hasRpm = true;
+            hasRpm_ = true;
+            adlx_int lo = 0, hi = 0;
+            if (ADLX_SUCCEEDED(ms->GetGPUFanSpeedRange(&lo, &hi))) {
+              f.metricMaxRpm = hi;
+            }
+          }
+        }
+      }
+      gpus_.push_back(f);
+    }
+    if (gpus_.empty()) return Fail("no controllable AMD GPU");
+    return true;
+  }
+
+  const char* Name() const override { return "adlx"; }
+  const char* Error() const override { return err_; }
+  int FanCount() const override { return (int)gpus_.size(); }
+  const char* FanLabel(int channel) const override {
+    static __declspec(thread) char label[16];  // per pipe-worker buffer
+    if ((int)gpus_.size() <= 1) return "GPU_fan";
+    sprintf_s(label, "GPU_fan_%d", channel + 1);
+    return label;
+  }
+  bool HasRpm() const override { return hasRpm_; }
+
+  int ReadPercent(int ch, int* pct) override {
+    GpuFan* f = Gpu(ch);
+    if (!f) return -1;
+    MutexLock lock(mutex_);
+    // Live duty % first (metrics v3), then RPM over the reported max,
+    // then the configured curve speed as last resort.
+    IADLXGPUMetricsPtr m;
+    if (perf_ &&
+        ADLX_SUCCEEDED(perf_->GetCurrentGPUMetrics(f->gpu, &m)) && m) {
+      IADLXGPUMetrics3Ptr m3(m);
+      adlx_int duty = -1;
+      if (m3 && ADLX_SUCCEEDED(m3->GPUFanDuty(&duty)) && duty >= 0) {
+        *pct = duty > 100 ? 100 : duty;
+        return 0;
+      }
+      adlx_int rpm = -1;
+      if (ADLX_SUCCEEDED(m->GPUFanSpeed(&rpm)) && rpm >= 0) {
+        int maxRpm = f->targetMode && f->targetMax > 0 ? f->targetMax
+                                                     : f->metricMaxRpm;
+        if (maxRpm > 0) {
+          int p = (rpm * 100 + maxRpm / 2) / maxRpm;
+          *pct = p > 100 ? 100 : p;
+          return 0;
+        }
+      }
+    }
+    // Last resort: the configured curve speed. Must be queried fresh —
+    // the cached list still holds values SetPercent wrote into it.
+    IADLXManualFanTuningStateListPtr live;
+    if (f->states &&
+        ADLX_SUCCEEDED(f->mft->GetFanTuningStates(&live)) && live) {
+      IADLXManualFanTuningStatePtr s;
+      if (ADLX_SUCCEEDED(live->At(live->Begin(), &s)) && s) {
+        adlx_int v = -1;
+        if (ADLX_SUCCEEDED(s->GetFanSpeed(&v)) && v >= 0) {
+          *pct = v;
+          return 0;
+        }
+      }
+    }
+    return -1;
+  }
+
+  int ReadRpm(int ch, int* rpm) override {
+    GpuFan* f = Gpu(ch);
+    if (!f || !f->hasRpm || !perf_) return -1;
+    MutexLock lock(mutex_);
+    IADLXGPUMetricsPtr m;
+    if (ADLX_FAILED(perf_->GetCurrentGPUMetrics(f->gpu, &m)) || !m) return -1;
+    adlx_int v = -1;
+    if (ADLX_FAILED(m->GPUFanSpeed(&v)) || v < 0) return -1;
+    *rpm = v;
+    return 0;
+  }
+
+  int SetPercent(int ch, int pct) override {
+    GpuFan* f = Gpu(ch);
+    if (!f || pct < 0 || pct > 100) return -1;
+    MutexLock lock(mutex_);
+    // Zero-RPM is a separate firmware switch on cards that have it —
+    // a 0% request wants the fan fully stopped.
+    if (f->zeroRpm) SetZeroRpm(f, pct == 0);
+    if (f->targetMode) {
+      adlx_int rpm = f->targetMax * pct / 100;
+      if (pct > 0 && rpm < f->targetMin) rpm = f->targetMin;
+      ADLX_RESULT r = f->mft->SetTargetFanSpeed(rpm);
+      if (r == ADLX_RESET_NEEDED && ResetFactory(f)) {
+        r = f->mft->SetTargetFanSpeed(rpm);
+      }
+      if (ADLX_FAILED(r)) return -1;
+    } else if (f->states) {
+      for (adlx_uint k = f->states->Begin(); k < f->states->End(); k++) {
+        IADLXManualFanTuningStatePtr s;
+        if (ADLX_FAILED(f->states->At(k, &s)) || !s) return -1;
+        if (ADLX_FAILED(s->SetFanSpeed(pct))) return -1;
+      }
+      if (ADLX_FAILED(ApplyStates(f, f->states))) return -1;
+    } else {
+      return -1;
+    }
+    f->manual = true;
+    return 0;
+  }
+
+  int SetAuto(int ch) override {
+    GpuFan* f = Gpu(ch);
+    if (!f) return -1;
+    MutexLock lock(mutex_);
+    if (f->zeroRpm) SetZeroRpm(f, f->zeroRpmBase);
+    // Factory-default states when the v1 interface offers them (survives
+    // service restarts where the captured baseline is itself our stale
+    // hold), else write the baseline back over the live list.
+    IADLXManualFanTuningStateListPtr def;
+    if (f->mft1 &&
+        ADLX_SUCCEEDED(f->mft1->GetDefaultFanTuningStates(&def)) && def &&
+        def->Size() > 0) {
+      if (ADLX_FAILED(ApplyStates(f, def))) return -1;
+    } else if (f->states &&
+               (int)f->baseline.size() == (int)f->states->Size()) {
+      int idx = 0;
+      for (adlx_uint k = f->states->Begin(); k < f->states->End();
+           k++, idx++) {
+        IADLXManualFanTuningStatePtr s;
+        if (ADLX_FAILED(f->states->At(k, &s)) || !s) return -1;
+        s->SetTemperature(f->baseline[idx].first);
+        s->SetFanSpeed(f->baseline[idx].second);
+      }
+      if (ADLX_FAILED(ApplyStates(f, f->states))) return -1;
+    } else if (f->targetMode) {
+      // No curve to restore — re-arm the driver's default target speed.
+      adlx_int dv = f->targetMin;
+      if (f->mft1) {
+        adlx_int dd = 0;
+        if (ADLX_SUCCEEDED(f->mft1->GetTargetFanSpeedDefault(&dd))) dv = dd;
+      }
+      ADLX_RESULT r = f->mft->SetTargetFanSpeed(dv);
+      if (r == ADLX_RESET_NEEDED && ResetFactory(f)) {
+        r = f->mft->SetTargetFanSpeed(dv);
+      }
+      if (ADLX_FAILED(r)) return -1;
+    }
+    f->manual = false;
+    return 0;
+  }
+
+  int IsManual(int ch) override {
+    GpuFan* f = Gpu(ch);
+    if (!f) return -1;
+    MutexLock lock(mutex_);
+    if (f->manual) return 1;
+    if (!f->states) return 0;  // a hold we didn't set can't be verified
+    adlx_bool factory = true;
+    if (ADLX_FAILED(tuning_->IsAtFactory(f->gpu, &factory)) || factory) {
+      return 0;
+    }
+    // Tuning isn't at factory — only treat it as a manual hold when the
+    // live curve reads flat (same speed on every state, e.g. our stale
+    // hold after a service restart). A real user curve stays "auto" so
+    // the watchdog never stomps it. Must query fresh states — the
+    // cached list still holds values SetPercent wrote into it.
+    IADLXManualFanTuningStateListPtr live;
+    if (ADLX_FAILED(f->mft->GetFanTuningStates(&live)) || !live) return 0;
+    int first = -1;
+    for (adlx_uint k = live->Begin(); k < live->End(); k++) {
+      IADLXManualFanTuningStatePtr s;
+      if (ADLX_FAILED(live->At(k, &s)) || !s) return 0;
+      adlx_int v = -1;
+      if (ADLX_FAILED(s->GetFanSpeed(&v)) || v < 0) return 0;
+      if (first < 0) {
+        first = v;
+      } else if (v != first) {
+        return 0;
+      }
+    }
+    return 1;
+  }
+
+  // GPU edge + hotspot junction temps via performance metrics.
+  void AppendTemps(std::string* out) override {
+    if (!perf_) return;
+    MutexLock lock(mutex_);
+    for (int i = 0; i < (int)gpus_.size(); i++) {
+      IADLXGPUMetricsPtr m;
+      if (ADLX_FAILED(perf_->GetCurrentGPUMetrics(gpus_[i].gpu, &m)) || !m) {
+        continue;
+      }
+      adlx_double t = 0;
+      char buf[32];
+      if (ADLX_SUCCEEDED(m->GPUTemperature(&t)) && t > 0 && t < 150) {
+        if ((int)gpus_.size() == 1) {
+          sprintf_s(buf, " GPU=%.0f", t);
+        } else {
+          sprintf_s(buf, " GPU_%d=%.0f", i + 1, t);
+        }
+        *out += buf;
+      }
+      t = 0;
+      if (ADLX_SUCCEEDED(m->GPUHotspotTemperature(&t)) && t > 0 && t < 150) {
+        if ((int)gpus_.size() == 1) {
+          sprintf_s(buf, " GPU_hotspot=%.0f", t);
+        } else {
+          sprintf_s(buf, " GPU_%d_hotspot=%.0f", i + 1, t);
+        }
+        *out += buf;
+      }
+    }
+  }
+
+ private:
+  // One controllable GPU = one fan channel — ADLX exposes a single fan
+  // control per GPU even for multi-fan cards.
+  struct GpuFan {
+    IADLXGPUPtr gpu;
+    IADLXManualFanTuningPtr mft;
+    IADLXManualFanTuning1Ptr mft1;                  // may be null
+    IADLXManualFanTuningStateListPtr states;        // may be null
+    std::vector<std::pair<int, int>> baseline;      // (temp, speed) at init
+    bool targetMode = false;   // SetTargetFanSpeed path
+    int targetMin = 0, targetMax = 0;               // RPM range
+    bool zeroRpm = false;      // zero-RPM supported
+    bool zeroRpmBase = false;  // zero-RPM flag at init
+    bool hasRpm = false;       // GPUFanSpeed metric supported
+    int metricMaxRpm = 0;      // metrics-reported RPM ceiling
+    bool manual = false;       // we hold this fan right now
+  };
+
+  bool Fail(const char* e) {
+    strncpy_s(err_, e, _TRUNCATE);
+    return false;
+  }
+
+  GpuFan* Gpu(int ch) {
+    return ch >= 0 && ch < (int)gpus_.size() ? &gpus_[ch] : nullptr;
+  }
+
+  // ADLX_RESET_NEEDED means the driver wants tuning wiped before the
+  // write applies — same retry FanControl's wrapper performs.
+  bool ResetFactory(GpuFan* f) {
+    return ADLX_SUCCEEDED(tuning_->ResetToFactory(f->gpu));
+  }
+
+  void SetZeroRpm(GpuFan* f, bool on) {
+    ADLX_RESULT r = f->mft->SetZeroRPMState(on);
+    if (r == ADLX_RESET_NEEDED && ResetFactory(f)) {
+      f->mft->SetZeroRPMState(on);
+    }
+  }
+
+  ADLX_RESULT ApplyStates(GpuFan* f, IADLXManualFanTuningStateList* list) {
+    ADLX_RESULT r = f->mft->SetFanTuningStates(list);
+    if (r == ADLX_RESET_NEEDED && ResetFactory(f)) {
+      r = f->mft->SetFanTuningStates(list);
+    }
+    return r;
+  }
+
+  // ADLX contract: every interface must be released before
+  // ADLXTerminate, and terminate before FreeLibrary — calls into
+  // unloaded code otherwise. Member smart pointers would release too
+  // late, so they are released explicitly here.
+  void Shutdown() {
+    gpus_.clear();
+    perf_.Release();
+    tuning_.Release();
+    if (system_ && terminate_) terminate_();
+    system_ = nullptr;
+    terminate_ = nullptr;
+    if (lib_) FreeLibrary(lib_);
+    lib_ = nullptr;
+  }
+
+  HMODULE lib_ = nullptr;
+  ADLXTerminate_Fn terminate_ = nullptr;
+  IADLXSystem* system_ = nullptr;  // not ref-counted — owned by ADLX,
+                                   // freed by ADLXTerminate
+  IADLXGPUTuningServicesPtr tuning_;
+  IADLXPerformanceMonitoringServicesPtr perf_;
+  std::vector<GpuFan> gpus_;
+  HANDLE mutex_ = nullptr;
+  bool hasRpm_ = false;
+  char err_[128] = {};
+};
+
+// SEH-guarded AdlxFans::Init: a corrupt amdadlx64.dll must not take the
+// service down. SEH can't share a function with objects that need C++
+// unwinding, so the caller owns the backend and this takes a raw
+// pointer. A crash mid-Init leaks Init's locals (SEH doesn't unwind) —
+// that beats calling back into the broken DLL to clean them up.
+static bool AdlxInitGuarded(AdlxFans* b, char* err, size_t errSize) {
+  __try {
+    if (b->Init()) return true;
+    strncpy_s(err, errSize, b->Error(), _TRUNCATE);
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    strncpy_s(err, errSize, "adlx: init crashed", _TRUNCATE);
+  }
+  return false;
+}
+
 // ------------------------------------------------------------- CPU temp
+
+// CPU vendor string check ("GenuineIntel", "AuthenticAMD", ...) via the
+// registry — cheaper and safer than executing CPUID here.
+static bool CpuVendorIs(const wchar_t* needle) {
+  wchar_t vendor[64] = {};
+  DWORD size = sizeof(vendor);
+  if (RegGetValueW(HKEY_LOCAL_MACHINE,
+                   L"HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0",
+                   L"VendorIdentifier", RRF_RT_REG_SZ, nullptr, vendor,
+                   &size) != ERROR_SUCCESS) {
+    return false;
+  }
+  return wcsstr(vendor, needle) != nullptr;
+}
 
 // Reads the Intel package temperature via the PawnIO IntelMSR module:
 // IA32_TEMPERATURE_TARGET (0x1A2) bits 23:16 -> TjMax,
@@ -673,17 +1164,7 @@ const SuperIoFans::ChipDef SuperIoFans::kChips[] = {
 // Intel-only MSRs — never executed on AMD/unknown CPUs.
 class CpuTemp {
  public:
-  static bool Supported() {
-    wchar_t vendor[64] = {};
-    DWORD size = sizeof(vendor);
-    if (RegGetValueW(HKEY_LOCAL_MACHINE,
-                     L"HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0",
-                     L"VendorIdentifier", RRF_RT_REG_SZ, nullptr, vendor,
-                     &size) != ERROR_SUCCESS) {
-      return false;
-    }
-    return wcsstr(vendor, L"GenuineIntel") != nullptr;
-  }
+  static bool Supported() { return CpuVendorIs(L"GenuineIntel"); }
 
   bool Init() {
     if (!pio_.Load(L"IntelMSR.bin")) return false;
@@ -712,6 +1193,67 @@ class CpuTemp {
 
   PawnIo pio_;
   int tjMax_ = 100;
+};
+
+// Reads the AMD reported die temperature (Tctl) via the PawnIO
+// AMDFamily17 module's ioctl_read_smn — same registers as Linux
+// k10temp (drivers/hwmon/k10temp.c), valid for all Zen families:
+//   SMN 0x59800 — bits 31:21 = temperature in 1/8 °C units; when
+//   ZEN_CUR_TEMP_TJ_SEL (bits 17:16) is 3 the reading is on a range
+//   shifted by -49 °C and that offset must be subtracted.
+// SMN index/data access must hold Global\Access_PCI (module warning;
+// matches SuperIoFans and LHM's accessMutex). Never runs on non-AMD.
+class AmdTemp {
+ public:
+  static bool Supported() { return CpuVendorIs(L"AuthenticAMD"); }
+
+  bool Init() {
+    mutex_ = CreateMutexW(nullptr, FALSE, L"Global\\Access_PCI");
+    return pio_.Load(L"AMDFamily17.bin");
+  }
+
+  // Returns Tctl in C, or -1 on error.
+  int Read() {
+    MutexLock lock(mutex_);
+    ULONG64 in[1] = {0x59800}, out[1] = {0};
+    if (pio_.Exec("ioctl_read_smn", in, 1, out, 1)) return -1;
+    ULONG64 v = out[0] & 0xFFFFFFFF;
+    double t = (double)(v >> 21) * 0.125;
+    if ((v & 0x30000) == 0x30000) t -= 49.0;  // TJ_SEL range offset
+    if (t < -49.0 || t > 125.0) return -1;    // implausible — bogus read
+    return (int)(t + 0.5);
+  }
+
+ private:
+  PawnIo pio_;
+  HANDLE mutex_ = nullptr;
+};
+
+// CPU package temp façade: picks the vendor-specific sensor once at Init
+// so the pipe layer just calls Read() regardless of CPU brand.
+class CpuPackageTemp {
+ public:
+  static bool Supported() {
+    return CpuTemp::Supported() || AmdTemp::Supported();
+  }
+
+  bool Init() {
+    if (CpuTemp::Supported()) return intel_.Init();
+    if (AmdTemp::Supported()) {
+      amd_ = true;
+      return amdTemp_.Init();
+    }
+    return false;
+  }
+
+  // Returns package/die temp in C, or -1 when unavailable. An
+  // uninitialized PawnIo Exec fails, so this never crashes.
+  int Read() { return amd_ ? amdTemp_.Read() : intel_.Read(); }
+
+ private:
+  CpuTemp intel_;
+  AmdTemp amdTemp_;
+  bool amd_ = false;
 };
 
 // ------------------------------------------------------------- SSD temp
@@ -756,7 +1298,7 @@ static int SsdTemp(int drive) {
 static std::vector<std::unique_ptr<FanBackend>> g_backends;
 // Merged index space: global fan index -> (backend, backend channel).
 static std::vector<std::pair<FanBackend*, int>> g_fans;
-static CpuTemp g_temp;
+static CpuPackageTemp g_temp;
 static volatile bool g_running = true;
 // Tick count of the last pipe command; the watchdog releases manual fan
 // holds when this goes stale (app crashed or exited).
@@ -780,6 +1322,17 @@ static void DetectBackends() {
       g_backends.push_back(std::move(ec));
     } else {
       EventLog(ec->Error());
+    }
+  }
+  // AMD GPU last — board/EC fans keep their indices on mixed systems.
+  // Guarded init: a broken ADLX install must never take down the service.
+  {
+    auto adlx = std::make_unique<AdlxFans>();
+    char adlxErr[128];
+    if (AdlxInitGuarded(adlx.get(), adlxErr, sizeof(adlxErr))) {
+      g_backends.push_back(std::move(adlx));
+    } else {
+      EventLog(adlxErr);
     }
   }
   for (auto& b : g_backends) {
@@ -968,7 +1521,7 @@ static DWORD WINAPI ServiceHandler(DWORD ctrl, DWORD, LPVOID, LPVOID) {
 
 static void ServiceRun() {
   DetectBackends();
-  if (CpuTemp::Supported()) g_temp.Init();  // optional sensor
+  if (CpuPackageTemp::Supported()) g_temp.Init();  // optional sensor
   g_stopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
   g_lastCmd = GetTickCount64();  // arm watchdog: clear stale holds if
                                  // no app connects within the timeout
@@ -1049,7 +1602,7 @@ int wmain(int argc, wchar_t** argv) {
   }
   if (argc > 1 && !wcscmp(argv[1], L"console")) {
     DetectBackends();
-    if (CpuTemp::Supported() && !g_temp.Init()) {
+    if (CpuPackageTemp::Supported() && !g_temp.Init()) {
       fprintf(stderr, "CPU temp sensor unavailable\n");
     }
     std::string names;
