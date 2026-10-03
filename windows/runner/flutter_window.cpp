@@ -20,7 +20,11 @@ constexpr const wchar_t kRunValueName[] = L"netturbine";
 // reads back one reply line. Returns false when the helper is unreachable.
 // Protocol (see windows/tools/fan_helper.cpp):
 //   "list"      -> "ok <count>"
+//   "caps"      -> "ok <flags>"          (bit0: rpm telemetry; absent on
+//                                         older helpers -> "err")
+//   "name <i>"  -> "ok <label>"          ('_' = space; absent on old helpers)
 //   "read <i>"  -> "ok <percent 0-100>"
+//   "rpm <i>"   -> "ok <rpm>"            (absent on old helpers)
 //   "mode <i>"  -> "ok <0 auto | 1 manual>"
 //   "set <i> <percent>" / "auto <i>" -> "ok" | "err <msg>"
 bool PipeRequest(const std::string& cmd, std::string* reply) {
@@ -70,6 +74,17 @@ bool PipeOk(const std::string& reply, int* value = nullptr) {
       return false;
     }
   }
+  return true;
+}
+
+// Extracts the payload of an "ok <text>" reply, turning '_' placeholders
+// back into spaces. Returns false when the reply is not "ok ...".
+bool PipeText(const std::string& reply, std::string* text) {
+  if (reply.rfind("ok ", 0) != 0) {
+    return false;
+  }
+  *text = reply.substr(3);
+  std::replace(text->begin(), text->end(), '_', ' ');
   return true;
 }
 
@@ -217,7 +232,7 @@ void FlutterWindow::HandleSystemCall(
 
 // Fan backend contract for lib/api/windows/windows_fan_controller.dart.
 // Proxies to the elevated NetturbineFanHelper service via
-// \\.\pipe\netturbine_fan (PawnIO + EC registers, see windows/tools/).
+// \\.\pipe\netturbine_fan (PawnIO backends, see windows/tools/).
 // When the helper is not installed/running, reports zero fans so the UI
 // degrades gracefully.
 void FlutterWindow::HandleFanCall(
@@ -228,8 +243,14 @@ void FlutterWindow::HandleFanCall(
     std::string reply;
     int count = 0;
     bool up = PipeRequest("list", &reply) && PipeOk(reply, &count);
+    int flags = 0;
+    // "caps"/"name"/"rpm" are newer protocol commands; an old helper
+    // answers "err" and the fields below fall back accordingly.
+    bool canRpm = PipeRequest("caps", &reply) && PipeOk(reply, &flags) &&
+                  (flags & 1) != 0;
     flutter::EncodableMap capabilities{
-        {flutter::EncodableValue("canReadRpm"), flutter::EncodableValue(false)},
+        {flutter::EncodableValue("canReadRpm"),
+         flutter::EncodableValue(canRpm)},
         {flutter::EncodableValue("canSetSpeed"), flutter::EncodableValue(up)},
     };
     flutter::EncodableList fans;
@@ -241,11 +262,22 @@ void FlutterWindow::HandleFanCall(
       int manual = 0;
       PipeRequest("mode " + std::to_string(i), &reply);
       PipeOk(reply, &manual);
+      std::string label;
+      if (!PipeRequest("name " + std::to_string(i), &reply) ||
+          !PipeText(reply, &label)) {
+        label = "Fan " + std::to_string(i + 1);
+      }
+      int rpm = 0;
+      bool hasRpm = canRpm &&
+                    PipeRequest("rpm " + std::to_string(i), &reply) &&
+                    PipeOk(reply, &rpm);
       flutter::EncodableMap fan{
           {flutter::EncodableValue("id"),
            flutter::EncodableValue("fan" + std::to_string(i))},
-          {flutter::EncodableValue("label"),
-           flutter::EncodableValue("Fan " + std::to_string(i + 1))},
+          {flutter::EncodableValue("label"), flutter::EncodableValue(label)},
+          {flutter::EncodableValue("rpm"),
+           hasRpm ? flutter::EncodableValue(rpm)
+                  : flutter::EncodableValue()},
           {flutter::EncodableValue("speedPercent"),
            readable ? flutter::EncodableValue(percent)
                     : flutter::EncodableValue()},

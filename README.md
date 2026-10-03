@@ -1,9 +1,10 @@
 # netturbine
 
-Fan control for the **HP OmniBook 7 (17-dc0xxx)** from the Windows system
-tray. A compact Windows 11-style flyout (built with Flutter desktop) on top
-of a small elevated helper service that talks to the laptop's embedded
-controller.
+Fan control from the Windows system tray. A compact Windows 11-style
+flyout (built with Flutter desktop) on top of a small elevated helper
+service that talks to the machine's fan controller through pluggable
+backends — Nuvoton Super I/O on desktops, the embedded controller on
+supported laptops.
 
 ## Features
 
@@ -18,12 +19,19 @@ controller.
 
 ## Hardware support
 
-Fan control is validated on the **HP OmniBook 7 17-dc0xxx** (Insyde BIOS) —
-the EC register map in `windows/tools/fan_helper.cpp` is read from that
-machine's DSDT. On other machines the app still runs fine; it simply reports
-no controllable fans instead of guessing at registers.
+Two backends are probed at startup; every detected fan appears in the UI:
 
-There is no RPM telemetry — fan speed is reported as percent only.
+- **Nuvoton Super I/O** (desktop motherboards) — NCT6779D and the whole
+  NCT679x family (6791/6792/6793/6795/6796/6797/6798/6799, NCT6701D),
+  detected by chip ID. Validated on an **MSI B450M PRO-VDH MAX**
+  (NCT6795D): per-header speed control plus RPM telemetry and board
+  temperature sensors. Unpopulated fan headers are hidden automatically.
+- **HP OmniBook 7 17-dc0xxx** (Insyde BIOS) — EC register map read from
+  that machine's DSDT; activates only on matching product names so unknown
+  ECs are never probed. Percent-only, no RPM.
+
+On machines with no matching controller the app still runs; it simply
+reports no controllable fans instead of guessing at registers.
 
 ## Requirements
 
@@ -55,14 +63,15 @@ lib/ui ──> lib/app ──> lib/api        (pure Dart, strict layering)
                           │
    NetturbineFanHelper service (elevated)
                           │
-            PawnIO → EC ports 0x62/0x66
+        PawnIO → backends: Super I/O / EC
 ```
 
 The app never touches hardware directly. The unelevated runner proxies a
 tiny line-based pipe protocol (`list`, `read <i>`, `set <i> <pct>`,
 `auto <i>`, `temps`, …) to the elevated helper service, which owns the
-PawnIO driver handle and serializes EC access through the global
-`Access_EC` mutex so it does not race `acpi.sys`.
+PawnIO driver handle and serializes hardware access through the same
+global mutexes LibreHardwareMonitor/FanControl use (`Access_EC`,
+`Access_ISABUS.HTP.Method`).
 
 Dependency direction is strict — `ui` → `app` → `api` — and only
 `lib/api/windows/` may use `MethodChannel`/`dart:io`. The API layer is

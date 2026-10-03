@@ -1,18 +1,27 @@
 // fan_helper — elevated helper for netturbine fan control.
 //
-// Talks to the embedded controller through PawnIO (LpcACPIEC.bin module,
-// ports 0x62/0x66), serialized via the global "Access_EC" mutex so it does
-// not race acpi.sys's own EC driver.
+// Hardware is reached through pluggable backends, probed at startup:
+//   - Nuvoton Super I/O (NCT6779D / NCT679x family) via the PawnIO LpcIO
+//     module — the standard fan controller on desktop motherboards.
+//     Detection and register map mirror LibreHardwareMonitor's Nct677X.
+//   - ACPI embedded controller via the PawnIO LpcACPIEC module — validated
+//     on the HP OmniBook 7 (17-dc0xxx, Insyde BIOS). Only enabled when the
+//     system product name reports an OmniBook; never probed elsewhere.
+// Fans from all active backends share one index space.
 //
 // Serves named pipe \\.\pipe\netturbine_fan with a line-based protocol:
 //   ping                -> "pong"
-//   list                -> "ok <n>"            (fan count)
-//   read <fan>          -> "ok <percent>"      (0-100)
-//   mode <fan>          -> "ok <0|1>"          (0 auto, 1 manual hold)
-//   set <fan> <pct>     -> "ok"                (holds fan at pct)
-//   auto <fan>          -> "ok"                (firmware control)
-//   temp                -> "ok <celsius>"      (CPU package temp)
-//   temps               -> "ok L=c [L=c ...]"  (all temp sensors; '_' = space)
+//   backend             -> "ok <name[+name...]>"   (active backends, "none")
+//   caps                -> "ok <flags>"            (bit0: rpm telemetry)
+//   list                -> "ok <n>"                (fan count)
+//   name <fan>          -> "ok <label>"            ('_' = space)
+//   read <fan>          -> "ok <percent>"          (0-100)
+//   rpm <fan>           -> "ok <rpm>"              (when caps bit0)
+//   mode <fan>          -> "ok <0|1>"              (0 auto, 1 manual hold)
+//   set <fan> <pct>     -> "ok"                    (holds fan at pct)
+//   auto <fan>          -> "ok"                    (firmware control)
+//   temp                -> "ok <celsius>"          (CPU package temp)
+//   temps               -> "ok L=c [L=c ...]"      (all temp sensors; '_' = space)
 //   anything else       -> "err <msg>"
 //
 // Modes:
@@ -21,25 +30,17 @@
 //   fan_helper.exe console    — run the pipe server in the foreground
 //   (no args, SCM-launched)   — service entry point
 //
-// Safety: a watchdog releases the manual-hold bits when no pipe command
-// arrives for ~30s, so a crashed/exited app never leaves fans pinned at
-// a stale setpoint.
+// Safety: a watchdog releases manual holds when no pipe command arrives
+// for ~30s, so a crashed/exited app never leaves fans pinned at a stale
+// setpoint.
 
 #include <windows.h>
 #include <winioctl.h>
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <vector>
-
-// ---------------------------------------------------------------- EC layer
-
-#define EC_DATA_PORT 0x62
-#define EC_SC_PORT   0x66
-#define EC_SC_OBF    0x01
-#define EC_SC_IBF    0x02
-#define EC_CMD_READ  0x80
-#define EC_CMD_WRITE 0x81
 
 typedef HRESULT(STDAPICALLTYPE* pawnio_open_fn)(PHANDLE);
 typedef HRESULT(STDAPICALLTYPE* pawnio_load_fn)(HANDLE, const UCHAR*, SIZE_T);
@@ -48,18 +49,45 @@ typedef HRESULT(STDAPICALLTYPE* pawnio_execute_fn)(HANDLE, PCSTR,
                                                  PULONG64, SIZE_T, PSIZE_T);
 typedef HRESULT(STDAPICALLTYPE* pawnio_close_fn)(HANDLE);
 
-struct FanRegs { ULONG64 read, write, hold; };
-// Offsets from this machine's DSDT (HP OmniBook 7, Insyde EC region RAM_).
-static const FanRegs kFans[] = {
-    {0x95, 0x94, 0x93},  // fan 0: FAN1/FSW1/FSH1
-    {0x83, 0x82, 0x81},  // fan 1: FAN2/FSW2/FSH2
+struct MutexLock {
+  explicit MutexLock(HANDLE m) : m_(m) {
+    if (m_) WaitForSingleObject(m_, 3000);
+  }
+  ~MutexLock() { if (m_) ReleaseMutex(m_); }
+  HANDLE m_;
 };
-static const ULONG64 kHoldBit = 0x10;
-static const int kFanCount = 2;
 
-class Ec {
+// Resolves a PawnIO module blob: next to the exe first (installed layout),
+// then <exe>\pawnio_modules\ (repo layout for console debugging).
+static bool ReadModuleBlob(const wchar_t* name, std::vector<BYTE>* blob) {
+  wchar_t dir[MAX_PATH];
+  GetModuleFileNameW(nullptr, dir, MAX_PATH);
+  wchar_t* slash = wcsrchr(dir, L'\\');
+  if (slash) *slash = 0;
+  HANDLE f = INVALID_HANDLE_VALUE;
+  for (int i = 0; i < 2 && f == INVALID_HANDLE_VALUE; i++) {
+    std::wstring path = std::wstring(dir) + (i == 0 ? L"\\" : L"\\pawnio_modules\\") + name;
+    f = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                    OPEN_EXISTING, 0, nullptr);
+  }
+  if (f == INVALID_HANDLE_VALUE) return false;
+  DWORD sz = GetFileSize(f, nullptr);
+  blob->resize(sz);
+  DWORD rd = 0;
+  ReadFile(f, blob->data(), sz, &rd, nullptr);
+  CloseHandle(f);
+  return rd == sz;
+}
+
+// Shared PawnIO binding: one driver handle + one loaded module blob.
+class PawnIo {
  public:
-  bool Init() {
+  ~PawnIo() {
+    if (pio_ && close_) close_(pio_);
+    if (lib_) FreeLibrary(lib_);
+  }
+
+  bool Load(const wchar_t* blobName) {
     lib_ = LoadLibraryW(L"PawnIOLib.dll");  // resolves via PATH / installed dir
     if (!lib_) lib_ = LoadLibraryW(L"C:\\Program Files\\PawnIO\\PawnIOLib.dll");
     if (!lib_) return Fail("PawnIOLib.dll not found");
@@ -68,102 +96,189 @@ class Ec {
     auto load = (pawnio_load_fn)GetProcAddress(lib_, "pawnio_load");
     close_ = (pawnio_close_fn)GetProcAddress(lib_, "pawnio_close");
     if (!exec_ || !open || !load || !close_) return Fail("PawnIOLib exports");
-
     if (FAILED(open(&pio_)) || !pio_) return Fail("pawnio_open");
 
-    wchar_t dir[MAX_PATH];
-    GetModuleFileNameW(nullptr, dir, MAX_PATH);
-    wchar_t* slash = wcsrchr(dir, L'\\');
-    if (slash) *slash = 0;
-    std::wstring blobPath = std::wstring(dir) + L"\\LpcACPIEC.bin";
-    HANDLE f = CreateFileW(blobPath.c_str(), GENERIC_READ, FILE_SHARE_READ,
-                           nullptr, OPEN_EXISTING, 0, nullptr);
-    if (f == INVALID_HANDLE_VALUE) {
-      blobPath = std::wstring(dir) + L"\\pawnio_modules\\LpcACPIEC.bin";
-      f = CreateFileW(blobPath.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
-                      OPEN_EXISTING, 0, nullptr);
-      if (f == INVALID_HANDLE_VALUE) return Fail("LpcACPIEC.bin not found");
-    }
-    DWORD sz = GetFileSize(f, nullptr);
-    std::vector<BYTE> blob(sz);
-    DWORD rd = 0;
-    ReadFile(f, blob.data(), sz, &rd, nullptr);
-    CloseHandle(f);
+    std::vector<BYTE> blob;
+    if (!ReadModuleBlob(blobName, &blob)) return Fail("module blob not found");
     if (FAILED(load(pio_, blob.data(), blob.size()))) return Fail("pawnio_load");
-
-    mutex_ = CreateMutexW(nullptr, FALSE, L"Global\\Access_EC");
     return true;
   }
 
-  ~Ec() {
-    if (mutex_) CloseHandle(mutex_);
-    if (pio_ && close_) close_(pio_);
-    if (lib_) FreeLibrary(lib_);
+  int Exec(const char* ioctl, const ULONG64* in, SIZE_T inCount, ULONG64* out,
+           SIZE_T outCount) {
+    if (!exec_ || !pio_) return -1;  // module never loaded
+    SIZE_T ret = 0;
+    return FAILED(exec_(pio_, ioctl, in, inCount, out, outCount, &ret)) ? -1 : 0;
   }
 
   const char* Error() const { return err_; }
 
-  int Read(int fan, ULONG64* v) {
-    if (fan < 0 || fan >= kFanCount) return -1;
-    Lock lock(mutex_);
-    return RawRead(kFans[fan].read, v);
+ private:
+  bool Fail(const char* e) {
+    strncpy_s(err_, e, _TRUNCATE);
+    return false;
   }
 
-  int SetPercent(int fan, int pct) {
+  HMODULE lib_ = nullptr;
+  HANDLE pio_ = nullptr;
+  pawnio_execute_fn exec_ = nullptr;
+  pawnio_close_fn close_ = nullptr;
+  char err_[128] = {};
+};
+
+// --------------------------------------------------------- backend contract
+
+// One detected fan source (EC, Super I/O chip, ...). Indices are the
+// backend's own channel numbers; the pipe layer maps them onto the merged
+// global index space.
+class FanBackend {
+ public:
+  virtual ~FanBackend() = default;
+  virtual const char* Name() const = 0;
+  virtual const char* Error() const = 0;
+  virtual int FanCount() const = 0;
+  virtual const char* FanLabel(int channel) const = 0;  // '_' for spaces
+  virtual bool HasRpm() const = 0;
+  virtual int ReadPercent(int channel, int* percent) = 0;
+  virtual int ReadRpm(int channel, int* rpm) = 0;  // -1 unsupported
+  virtual int SetPercent(int channel, int percent) = 0;
+  virtual int SetAuto(int channel) = 0;
+  virtual int IsManual(int channel) = 0;  // 1 manual, 0 auto, -1 error
+  virtual void AppendTemps(std::string* out) = 0;
+};
+
+// ------------------------------------------------------------------ EC fans
+
+#define EC_DATA_PORT 0x62
+#define EC_SC_PORT   0x66
+#define EC_SC_OBF    0x01
+#define EC_SC_IBF    0x02
+#define EC_CMD_READ  0x80
+#define EC_CMD_WRITE 0x81
+
+// ACPI embedded controller fan control — validated on the HP OmniBook 7
+// 17-dc0xxx (Insyde BIOS). The register map is read from that machine's
+// DSDT, so the backend only activates when the product name reports an
+// OmniBook; unknown ECs are never probed.
+class EcFans : public FanBackend {
+ public:
+  static bool Supported() {
+    wchar_t product[128] = {};
+    DWORD size = sizeof(product);
+    if (RegGetValueW(HKEY_LOCAL_MACHINE,
+                     L"HARDWARE\\DESCRIPTION\\System\\BIOS",
+                     L"SystemProductName", RRF_RT_REG_SZ, nullptr, product,
+                     &size) != ERROR_SUCCESS) {
+      return false;
+    }
+    return wcsstr(product, L"OmniBook") != nullptr;
+  }
+
+  bool Init() {
+    if (!pio_.Load(L"LpcACPIEC.bin")) return Fail(pio_.Error());
+    mutex_ = CreateMutexW(nullptr, FALSE, L"Global\\Access_EC");
+    return true;
+  }
+
+  const char* Name() const override { return "ec"; }
+  const char* Error() const override { return err_; }
+  int FanCount() const override { return kFanCount; }
+  const char* FanLabel(int channel) const override {
+    static const char* kLabels[] = {"Fan_1", "Fan_2"};
+    return channel >= 0 && channel < kFanCount ? kLabels[channel] : "Fan";
+  }
+  bool HasRpm() const override { return false; }  // EC reports percent only
+
+  int ReadPercent(int fan, int* pct) override {
+    if (fan < 0 || fan >= kFanCount) return -1;
+    MutexLock lock(mutex_);
+    ULONG64 v = 0;
+    if (RawRead(kFans[fan].read, &v)) return -1;
+    *pct = (int)v;
+    return 0;
+  }
+
+  int ReadRpm(int, int*) override { return -1; }
+
+  int SetPercent(int fan, int pct) override {
     if (fan < 0 || fan >= kFanCount || pct < 0 || pct > 100) return -1;
-    Lock lock(mutex_);
+    MutexLock lock(mutex_);
     ULONG64 hold = 0;
     if (RawRead(kFans[fan].hold, &hold)) return -1;
     if (RawWrite(kFans[fan].hold, hold | kHoldBit)) return -1;
     return RawWrite(kFans[fan].write, (ULONG64)pct);
   }
 
-  int SetAuto(int fan) {
+  int SetAuto(int fan) override {
     if (fan < 0 || fan >= kFanCount) return -1;
-    Lock lock(mutex_);
+    MutexLock lock(mutex_);
     ULONG64 hold = 0;
     if (RawRead(kFans[fan].hold, &hold)) return -1;
     return RawWrite(kFans[fan].hold, hold & ~kHoldBit);
   }
 
-  // Read an arbitrary EC RAM register. Used for the thermal-sensor block.
-  int ReadReg(ULONG64 addr, ULONG64* v) {
-    Lock lock(mutex_);
-    return RawRead(addr, v);
-  }
-
   // Returns 1 when the manual-hold bit is set, 0 for firmware control,
   // -1 on error.
-  int IsManual(int fan) {
+  int IsManual(int fan) override {
     if (fan < 0 || fan >= kFanCount) return -1;
-    Lock lock(mutex_);
+    MutexLock lock(mutex_);
     ULONG64 hold = 0;
     if (RawRead(kFans[fan].hold, &hold)) return -1;
     return (hold & kHoldBit) ? 1 : 0;
   }
 
- private:
-  struct Lock {
-    explicit Lock(HANDLE m) : m_(m) {
-      if (m_) WaitForSingleObject(m_, 3000);
+  // EC thermal-sensor block THS0..THSF lives at 0xA8..0xB7 (ECMB maps
+  // there); entries reading 0x00 or >= 0x80 are unpopulated slots. Names
+  // come from the DSDT's second Field(ECMB) block: CPUT/MSKT/AMBT/VDIN/PCHT.
+  // VDIN is the DC-input area thermistor per Insyde convention.
+  void AppendTemps(std::string* out) override {
+    static const char* kThsName[16] = {"CPU_EC", "Skin",   "Ambient",
+                                       "DC-In",  "PCH",    nullptr,
+                                       nullptr,  nullptr,  nullptr,
+                                       nullptr,  nullptr,  nullptr,
+                                       nullptr,  nullptr,  nullptr,
+                                       nullptr};
+    MutexLock lock(mutex_);
+    for (int i = 0; i < 16; i++) {
+      ULONG64 v = 0;
+      if (RawRead(0xA8 + i, &v) == 0 && v >= 1 && v < 0x80) {
+        char buf[24];
+        if (kThsName[i]) {
+          sprintf_s(buf, " %s=%llu", kThsName[i], v);
+        } else {
+          sprintf_s(buf, " Zone_%d=%llu", i, v);
+        }
+        *out += buf;
+      }
     }
-    ~Lock() { if (m_) ReleaseMutex(m_); }
-    HANDLE m_;
-  };
+  }
 
-  bool Fail(const char* e) { strncpy_s(err_, e, _TRUNCATE); return false; }
+ private:
+  struct FanRegs {
+    ULONG64 read, write, hold;
+  };
+  // Offsets from the OmniBook's DSDT (Insyde EC region RAM_).
+  static constexpr FanRegs kFans[] = {
+      {0x95, 0x94, 0x93},  // fan 0: FAN1/FSW1/FSH1
+      {0x83, 0x82, 0x81},  // fan 1: FAN2/FSW2/FSH2
+  };
+  static const ULONG64 kHoldBit = 0x10;
+  static const int kFanCount = 2;
+
+  bool Fail(const char* e) {
+    strncpy_s(err_, e, _TRUNCATE);
+    return false;
+  }
 
   int PioRead(ULONG64 port, ULONG64* val) {
     ULONG64 in[1] = {port}, out[1] = {0};
-    SIZE_T ret = 0;
-    if (FAILED(exec_(pio_, "ioctl_pio_read", in, 1, out, 1, &ret))) return -1;
+    if (pio_.Exec("ioctl_pio_read", in, 1, out, 1)) return -1;
     *val = out[0];
     return 0;
   }
   int PioWrite(ULONG64 port, ULONG64 val) {
-    ULONG64 in[2] = {port, val}, out[1];
-    SIZE_T ret = 0;
-    return FAILED(exec_(pio_, "ioctl_pio_write", in, 2, out, 0, &ret)) ? -1 : 0;
+    ULONG64 in[2] = {port, val};
+    return pio_.Exec("ioctl_pio_write", in, 2, nullptr, 0);
   }
   int WaitEc(int bit, int wantSet) {
     for (int i = 0; i < 2000; i++) {
@@ -208,13 +323,328 @@ class Ec {
     return -1;
   }
 
-  HMODULE lib_ = nullptr;
-  HANDLE pio_ = nullptr;
+  PawnIo pio_;
   HANDLE mutex_ = nullptr;
-  pawnio_execute_fn exec_ = nullptr;
-  pawnio_close_fn close_ = nullptr;
   char err_[128] = {};
 };
+
+// ----------------------------------------------------- Nuvoton Super I/O
+
+// Nuvoton NCT6779D / NCT679x hardware monitor — the standard fan
+// controller on desktop motherboards. Detection flow and register map
+// follow LibreHardwareMonitor's Nct677X (same path FanControl uses):
+//   config port 0x2E/0x4E, enter 0x87 0x87, chip ID regs 0x20/0x21,
+//   hwmon LDN 0x0B, base address regs 0x60/0x61, vendor 0x5CA3.
+// The LpcIO pawn module whitelists the config port plus all BARs it
+// discovers via ioctl_find_bars, so hwmon access is range-checked.
+class SuperIoFans : public FanBackend {
+ public:
+  bool Init() {
+    if (!pio_.Load(L"LpcIO.bin")) return Fail(pio_.Error());
+    // Same mutex LibreHardwareMonitor/FanControl hold around ISA access —
+    // keeps us from racing them if both run at once.
+    mutex_ = CreateMutexW(nullptr, FALSE,
+                          L"Global\\Access_ISABUS.HTP.Method");
+    MutexLock lock(mutex_);
+    for (int slot = 0; slot < 2 && !chip_; slot++) Probe(slot);
+    if (!chip_) return Fail("no Nuvoton super I/O");
+    // Expose only channels that look populated: a live tach reading, or a
+    // saturated tach while the firmware still runs the header (SmartFan
+    // mode). Saturated tach + software mode is what unpopulated headers
+    // report — skip those so the UI shows real fans only.
+    for (int i = 0; i < chip_->fans; i++) {
+      int rpm = 0;
+      int status = Tach(i, &rpm);
+      ULONG64 mode = 0;
+      HwRead(kModeReg[i], &mode);
+      if (status == 0 || (status == 1 && mode != 0)) channels_.push_back(i);
+    }
+    if (channels_.empty()) return Fail("no fan channels");
+    return true;
+  }
+
+  const char* Name() const override { return chip_ ? chip_->name : "superio"; }
+  const char* Error() const override { return err_; }
+  int FanCount() const override { return (int)channels_.size(); }
+  const char* FanLabel(int channel) const override {
+    static __declspec(thread) char label[16];  // per pipe-worker buffer
+    int i = channel >= 0 && channel < (int)channels_.size()
+                ? channels_[channel]
+                : channel;
+    sprintf_s(label, "Fan_%d", i + 1);
+    return label;
+  }
+  bool HasRpm() const override { return true; }
+
+  int ReadPercent(int channel, int* pct) override {
+    int ch = Chan(channel);
+    if (ch < 0) return -1;
+    MutexLock lock(mutex_);
+    ULONG64 v = 0;
+    if (HwRead(pwmOut_[ch], &v)) return -1;
+    *pct = (int)((v * 100 + 127) / 255);
+    return 0;
+  }
+
+  int ReadRpm(int channel, int* rpm) override {
+    int ch = Chan(channel);
+    if (ch < 0) return -1;
+    MutexLock lock(mutex_);
+    return Tach(ch, rpm) >= 0 ? 0 : -1;
+  }
+
+  int SetPercent(int channel, int pct) override {
+    int ch = Chan(channel);
+    if (ch < 0 || pct < 0 || pct > 100) return -1;
+    MutexLock lock(mutex_);
+    if (!saved_[ch]) {
+      ULONG64 m = 0, p = 0;
+      if (HwRead(kModeReg[ch], &m) || HwRead(kPwmCmdReg[ch], &p)) return -1;
+      savedMode_[ch] = (BYTE)m;
+      savedPwm_[ch] = (BYTE)p;
+      saved_[ch] = true;
+    }
+    // Mode 0 = software (manual) control through the PWM command register.
+    if (HwWrite(kModeReg[ch], 0)) return -1;
+    return HwWrite(kPwmCmdReg[ch], (ULONG64)(pct * 255 + 50) / 100);
+  }
+
+  int SetAuto(int channel) override {
+    int ch = Chan(channel);
+    if (ch < 0) return -1;
+    MutexLock lock(mutex_);
+    if (saved_[ch]) {
+      if (HwWrite(kModeReg[ch], savedMode_[ch])) return -1;
+      if (HwWrite(kPwmCmdReg[ch], savedPwm_[ch])) return -1;
+      saved_[ch] = false;
+    }
+    return 0;
+  }
+
+  int IsManual(int channel) override {
+    int ch = Chan(channel);
+    if (ch < 0) return -1;
+    MutexLock lock(mutex_);
+    ULONG64 m = 0;
+    if (HwRead(kModeReg[ch], &m)) return -1;
+    return m == 0 ? 1 : 0;
+  }
+
+  void AppendTemps(std::string* out) override {
+    MutexLock lock(mutex_);
+    const TempReg* temps = chip_->temps;
+    for (int i = 0; temps[i].label; i++) {
+      ULONG64 v = 0;
+      // Temperatures are signed bytes; 0 and >= 0x7F are unpopulated or
+      // invalid-source markers on this family.
+      if (HwRead(temps[i].reg, &v) == 0 && v >= 1 && v < 0x7F) {
+        char buf[24];
+        sprintf_s(buf, " %s=%llu", temps[i].label, v);
+        *out += buf;
+      }
+    }
+  }
+
+ private:
+  struct TempReg {
+    const char* label;
+    USHORT reg;
+  };
+  struct ChipDef {
+    BYTE id, rev, revMask;
+    const char* name;
+    int fans;          // fan/control channel count
+    bool newPwmOut;    // newer PWM-out map (NCT6796DR+)
+    const TempReg* temps;
+  };
+
+  // Hwmon registers are banked: high byte of the address selects the bank
+  // (written to index 0x4E), low byte is the in-bank register.
+  // Fan duty readout (0-255), manual PWM value, and mode (0 = software
+  // control), one entry per channel.
+  static const USHORT kPwmOutOld[7];
+  static const USHORT kPwmOutNew[7];
+  static const USHORT kPwmCmdReg[7];
+  static const USHORT kModeReg[7];
+  // 13-bit fan tach counters; RPM = 1.35e6 / count.
+  static const USHORT kFanCountReg[7];
+  static const int kCountMin = 0x15;
+  static const int kCountMax = 0x1FFF;
+
+  static const TempReg kTemps679x[];
+  static const TempReg kTemps6779[];
+  static const ChipDef kChips[];
+
+  bool Fail(const char* e) {
+    strncpy_s(err_, e, _TRUNCATE);
+    return false;
+  }
+
+  int Chan(int index) const {
+    return index >= 0 && index < (int)channels_.size() ? channels_[index] : -1;
+  }
+
+  int PortIn(ULONG64 port, ULONG64* v) {
+    ULONG64 in[1] = {port}, out[1] = {0};
+    if (pio_.Exec("ioctl_pio_inb", in, 1, out, 1)) return -1;
+    *v = out[0];
+    return 0;
+  }
+  int PortOut(ULONG64 port, ULONG64 val) {
+    ULONG64 in[2] = {port, val};
+    return pio_.Exec("ioctl_pio_outb", in, 2, nullptr, 0);
+  }
+  int SuperioIn(ULONG64 reg, ULONG64* v) {
+    ULONG64 in[1] = {reg}, out[1] = {0};
+    if (pio_.Exec("ioctl_superio_inb", in, 1, out, 1)) return -1;
+    *v = out[0];
+    return 0;
+  }
+  int SuperioInw(ULONG64 reg, ULONG64* v) {
+    ULONG64 in[1] = {reg}, out[1] = {0};
+    if (pio_.Exec("ioctl_superio_inw", in, 1, out, 1)) return -1;
+    *v = out[0];
+    return 0;
+  }
+  int SuperioOut(ULONG64 reg, ULONG64 val) {
+    ULONG64 in[2] = {reg, val};
+    return pio_.Exec("ioctl_superio_outb", in, 2, nullptr, 0);
+  }
+
+  // Hwmon-space access through the address/data port pair at base+5/+6.
+  int HwRead(USHORT reg, ULONG64* v) {
+    if (PortOut(hwmon_ + 5, 0x4E) || PortOut(hwmon_ + 6, reg >> 8) ||
+        PortOut(hwmon_ + 5, reg & 0xFF) || PortIn(hwmon_ + 6, v)) {
+      return -1;
+    }
+    return 0;
+  }
+  int HwWrite(USHORT reg, ULONG64 val) {
+    if (PortOut(hwmon_ + 5, 0x4E) || PortOut(hwmon_ + 6, reg >> 8) ||
+        PortOut(hwmon_ + 5, reg & 0xFF) || PortOut(hwmon_ + 6, val)) {
+      return -1;
+    }
+    return 0;
+  }
+
+  // 13-bit tach counter: RPM = 1.35e6 / count. Returns 0 for a live
+  // reading, 1 when the counter is saturated (fan stopped or header
+  // empty), -2 when the count says no fan is wired, -1 on read error.
+  int Tach(int ch, int* rpm) {
+    ULONG64 hi = 0, lo = 0;
+    if (HwRead(kFanCountReg[ch], &hi) || HwRead(kFanCountReg[ch] + 1, &lo)) {
+      return -1;
+    }
+    int count = (int)((hi << 5) | (lo & 0x1F));
+    if (count >= kCountMax) {
+      *rpm = 0;
+      return 1;
+    }
+    if (count < kCountMin) return -2;
+    *rpm = 1350000 / count;
+    return 0;
+  }
+
+  void Probe(int slot) {
+    const ULONG64 regPort = slot == 0 ? 0x2E : 0x4E;
+    ULONG64 in[1] = {(ULONG64)slot};
+    if (pio_.Exec("ioctl_select_slot", in, 1, nullptr, 0)) return;
+    // Winbond/Nuvoton/Fintek config mode: 0x87 twice to enter, 0xAA exit.
+    PortOut(regPort, 0x87);
+    PortOut(regPort, 0x87);
+    ULONG64 id = 0, rev = 0;
+    SuperioIn(0x20, &id);   // chip ID register
+    SuperioIn(0x21, &rev);  // chip revision register
+    const ChipDef* chip = nullptr;
+    for (int i = 0; kChips[i].name; i++) {
+      if (kChips[i].id == id && (rev & kChips[i].revMask) == kChips[i].rev) {
+        chip = &kChips[i];
+        break;
+      }
+    }
+    if (!chip) {
+      PortOut(regPort, 0xAA);
+      return;
+    }
+    // Scan LDN base-address registers so the module whitelists the hwmon
+    // port range; must run while still in config mode.
+    pio_.Exec("ioctl_find_bars", nullptr, 0, nullptr, 0);
+    SuperioOut(0x07, 0x0B);  // select hardware-monitor logical device
+    ULONG64 a1 = 0, a2 = 0;
+    SuperioInw(0x60, &a1);  // base address registers 0x60/0x61
+    Sleep(1);
+    SuperioInw(0x60, &a2);
+    // Config reg 0x28 bit 4 = hwmon I/O space lock; clear it on 679xD.
+    ULONG64 lockReg = 0;
+    if (SuperioIn(0x28, &lockReg) == 0 && (lockReg & 0x10)) {
+      SuperioOut(0x28, lockReg & ~0x10ULL);
+    }
+    PortOut(regPort, 0xAA);
+    USHORT base = (USHORT)a1;
+    if (a1 != a2 || base < 0x100 || (base & 0xF007) != 0) return;
+    // Confirm through the hwmon space: bank 8 reg 0x4F + bank 0 reg 0x4F
+    // hold the Nuvoton vendor ID 0x5CA3.
+    ULONG64 hi = 0, lo = 0;
+    hwmon_ = base;
+    if (HwRead(0x804F, &hi) || HwRead(0x004F, &lo) ||
+        ((hi << 8) | lo) != 0x5CA3) {
+      hwmon_ = 0;
+      return;
+    }
+    chip_ = chip;
+    pwmOut_ = chip->newPwmOut ? kPwmOutNew : kPwmOutOld;
+  }
+
+  PawnIo pio_;
+  HANDLE mutex_ = nullptr;
+  const ChipDef* chip_ = nullptr;
+  const USHORT* pwmOut_ = nullptr;
+  USHORT hwmon_ = 0;
+  std::vector<int> channels_;  // exposed index -> chip channel
+  bool saved_[7] = {};
+  BYTE savedMode_[7] = {};
+  BYTE savedPwm_[7] = {};
+  char err_[128] = {};
+};
+
+const USHORT SuperIoFans::kPwmOutOld[7] = {0x001, 0x003, 0x011, 0x013,
+                                           0x015, 0x017, 0x029};
+const USHORT SuperIoFans::kPwmOutNew[7] = {0x001, 0x003, 0x011, 0x013,
+                                           0x015, 0xA09, 0xB09};
+const USHORT SuperIoFans::kPwmCmdReg[7] = {0x109, 0x209, 0x309, 0x809,
+                                           0x909, 0xA09, 0xB09};
+const USHORT SuperIoFans::kModeReg[7] = {0x102, 0x202, 0x302, 0x802,
+                                         0x902, 0xA02, 0xB02};
+const USHORT SuperIoFans::kFanCountReg[7] = {0x4B0, 0x4B2, 0x4B4, 0x4B6,
+                                             0x4B8, 0x4BA, 0x4CC};
+
+// Temperature inputs for the NCT6791D-6799D family (CPUTIN = CPU source,
+// SYSTIN = motherboard, AUXTINn = board auxiliaries).
+const SuperIoFans::TempReg SuperIoFans::kTemps679x[] = {
+    {"CPU_PECI", 0x073}, {"CPU", 0x075}, {"Motherboard", 0x077},
+    {"Aux_0", 0x079},    {"Aux_1", 0x07B}, {"Aux_2", 0x07D},
+    {"Aux_3", 0x4A0},    {"Aux_4", 0x027}, {nullptr, 0}};
+const SuperIoFans::TempReg SuperIoFans::kTemps6779[] = {
+    {"CPU", 0x073},      {"Motherboard", 0x075}, {"CPU_PECI", 0x027},
+    {"Aux_0", 0x077},    {"Aux_1", 0x079},       {"Aux_2", 0x07B},
+    {"Aux_3", 0x150},    {nullptr, 0}};
+
+// Chip-ID/revision table (config regs 0x20/0x21) for the family whose
+// register map above applies. Unknown IDs are left alone.
+const SuperIoFans::ChipDef SuperIoFans::kChips[] = {
+    {0xC5, 0x60, 0xF0, "nct6779d", 5, false, kTemps6779},
+    {0xC8, 0x03, 0xFF, "nct6791d", 6, false, kTemps679x},
+    {0xC9, 0x11, 0xFF, "nct6792d", 6, false, kTemps679x},
+    {0xC9, 0x13, 0xFF, "nct6792da", 6, false, kTemps679x},
+    {0xD1, 0x21, 0xFF, "nct6793d", 6, false, kTemps679x},
+    {0xD3, 0x52, 0xFF, "nct6795d", 6, false, kTemps679x},
+    {0xD4, 0x23, 0xFF, "nct6796d", 6, false, kTemps679x},
+    {0xD4, 0x2A, 0xFF, "nct6796dr", 7, true, kTemps679x},
+    {0xD4, 0x51, 0xFF, "nct6797d", 7, true, kTemps679x},
+    {0xD4, 0x2B, 0xFF, "nct6798d", 7, true, kTemps679x},
+    {0xD8, 0x02, 0xFF, "nct6799d", 7, true, kTemps679x},
+    {0xD8, 0x06, 0xFF, "nct6701d", 7, false, kTemps679x},
+    {0, 0, 0, nullptr, 0, false, nullptr}};
 
 // ------------------------------------------------------------- CPU temp
 
@@ -222,49 +652,28 @@ class Ec {
 // IA32_TEMPERATURE_TARGET (0x1A2) bits 23:16 -> TjMax,
 // IA32_PACKAGE_THERM_STATUS (0x1B1) bit 31 = valid, bits 22:16 = readout.
 // Package temp = TjMax - readout.
+// Intel-only MSRs — never executed on AMD/unknown CPUs.
 class CpuTemp {
  public:
-  bool Init() {
-    HMODULE lib = LoadLibraryW(L"PawnIOLib.dll");
-    if (!lib)
-      lib = LoadLibraryW(L"C:\\Program Files\\PawnIO\\PawnIOLib.dll");
-    if (!lib) return false;
-    exec_ = (pawnio_execute_fn)GetProcAddress(lib, "pawnio_execute");
-    auto open = (pawnio_open_fn)GetProcAddress(lib, "pawnio_open");
-    auto load = (pawnio_load_fn)GetProcAddress(lib, "pawnio_load");
-    close_ = (pawnio_close_fn)GetProcAddress(lib, "pawnio_close");
-    if (!exec_ || !open || !load || !close_) return false;
-    if (FAILED(open(&pio_)) || !pio_) return false;
-
-    wchar_t dir[MAX_PATH];
-    GetModuleFileNameW(nullptr, dir, MAX_PATH);
-    wchar_t* slash = wcsrchr(dir, L'\\');
-    if (slash) *slash = 0;
-    std::wstring blobPath = std::wstring(dir) + L"\\IntelMSR.bin";
-    HANDLE f = CreateFileW(blobPath.c_str(), GENERIC_READ, FILE_SHARE_READ,
-                           nullptr, OPEN_EXISTING, 0, nullptr);
-    if (f == INVALID_HANDLE_VALUE) {
-      blobPath = std::wstring(dir) + L"\\pawnio_modules\\IntelMSR.bin";
-      f = CreateFileW(blobPath.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
-                      OPEN_EXISTING, 0, nullptr);
-      if (f == INVALID_HANDLE_VALUE) return false;
+  static bool Supported() {
+    wchar_t vendor[64] = {};
+    DWORD size = sizeof(vendor);
+    if (RegGetValueW(HKEY_LOCAL_MACHINE,
+                     L"HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0",
+                     L"VendorIdentifier", RRF_RT_REG_SZ, nullptr, vendor,
+                     &size) != ERROR_SUCCESS) {
+      return false;
     }
-    DWORD sz = GetFileSize(f, nullptr);
-    std::vector<BYTE> blob(sz);
-    DWORD rd = 0;
-    ReadFile(f, blob.data(), sz, &rd, nullptr);
-    CloseHandle(f);
-    if (FAILED(load(pio_, blob.data(), blob.size()))) return false;
+    return wcsstr(vendor, L"GenuineIntel") != nullptr;
+  }
 
+  bool Init() {
+    if (!pio_.Load(L"IntelMSR.bin")) return false;
     ULONG64 tjField = 0;
     if (ReadMsr(0x1A2, &tjField)) return false;
     tjMax_ = (int)((tjField >> 16) & 0xFF);
     if (tjMax_ <= 0 || tjMax_ > 130) tjMax_ = 100;  // sane default
     return true;
-  }
-
-  ~CpuTemp() {
-    if (pio_ && close_) close_(pio_);
   }
 
   // Returns package temp in C, or -1 on error.
@@ -278,15 +687,12 @@ class CpuTemp {
  private:
   int ReadMsr(ULONG64 msr, ULONG64* val) {
     ULONG64 in[1] = {msr}, out[1] = {0};
-    SIZE_T ret = 0;
-    if (FAILED(exec_(pio_, "ioctl_read_msr", in, 1, out, 1, &ret))) return -1;
+    if (pio_.Exec("ioctl_read_msr", in, 1, out, 1)) return -1;
     *val = out[0];
     return 0;
   }
 
-  HANDLE pio_ = nullptr;
-  pawnio_execute_fn exec_ = nullptr;
-  pawnio_close_fn close_ = nullptr;
+  PawnIo pio_;
   int tjMax_ = 100;
 };
 
@@ -329,12 +735,41 @@ static int SsdTemp(int drive) {
 
 // ------------------------------------------------------- pipe server layer
 
-static Ec g_ec;
+static std::vector<std::unique_ptr<FanBackend>> g_backends;
+// Merged index space: global fan index -> (backend, backend channel).
+static std::vector<std::pair<FanBackend*, int>> g_fans;
 static CpuTemp g_temp;
 static volatile bool g_running = true;
 // Tick count of the last pipe command; the watchdog releases manual fan
 // holds when this goes stale (app crashed or exited).
 static volatile ULONGLONG g_lastCmd = 0;
+
+static void EventLog(const char* msg);
+
+// Probes all backends and builds the merged fan map. Super I/O first —
+// desktop boards answer with real chip IDs; the EC backend additionally
+// checks the product name so it never pokes an unknown controller.
+static void DetectBackends() {
+  auto sio = std::make_unique<SuperIoFans>();
+  if (sio->Init()) {
+    g_backends.push_back(std::move(sio));
+  } else {
+    EventLog(sio->Error());
+  }
+  if (EcFans::Supported()) {
+    auto ec = std::make_unique<EcFans>();
+    if (ec->Init()) {
+      g_backends.push_back(std::move(ec));
+    } else {
+      EventLog(ec->Error());
+    }
+  }
+  for (auto& b : g_backends) {
+    for (int i = 0; i < b->FanCount(); i++) {
+      g_fans.push_back({b.get(), i});
+    }
+  }
+}
 
 static std::string Handle(const std::string& line) {
   g_lastCmd = GetTickCount64();
@@ -343,32 +778,68 @@ static std::string Handle(const std::string& line) {
                    (unsigned)sizeof(a), b, (unsigned)sizeof(b));
   if (n <= 0) return "err empty";
   if (!strcmp(cmd, "ping")) return "pong";
-  if (!strcmp(cmd, "list")) {
-    char buf[32];
-    sprintf_s(buf, "ok %d", kFanCount);
+  if (!strcmp(cmd, "backend")) {
+    if (g_backends.empty()) return "ok none";
+    std::string out = "ok";
+    for (auto& b : g_backends) out += std::string(" ") + b->Name();
+    return out;
+  }
+  if (!strcmp(cmd, "caps")) {
+    int flags = 0;
+    for (auto& b : g_backends) {
+      if (b->HasRpm()) flags |= 1;
+    }
+    char buf[16];
+    sprintf_s(buf, "ok %d", flags);
     return buf;
   }
-  if (!strcmp(cmd, "read") && n == 2) {
-    ULONG64 v;
-    if (g_ec.Read(atoi(a), &v) == 0) {
+  if (!strcmp(cmd, "list")) {
+    char buf[32];
+    sprintf_s(buf, "ok %d", (int)g_fans.size());
+    return buf;
+  }
+  int fan = (n >= 2) ? atoi(a) : -1;
+  FanBackend* be = nullptr;
+  int ch = -1;
+  if (fan >= 0 && fan < (int)g_fans.size()) {
+    be = g_fans[fan].first;
+    ch = g_fans[fan].second;
+  }
+  if (!strcmp(cmd, "name") && n == 2 && be) {
+    std::string out = "ok ";
+    out += be->FanLabel(ch);
+    return out;
+  }
+  if (!strcmp(cmd, "read") && n == 2 && be) {
+    int pct = 0;
+    if (be->ReadPercent(ch, &pct) == 0) {
       char buf[32];
-      sprintf_s(buf, "ok %llu", v);
+      sprintf_s(buf, "ok %d", pct);
       return buf;
     }
-    return "err ec";
+    return "err hw";
   }
-  if (!strcmp(cmd, "set") && n == 3)
-    return g_ec.SetPercent(atoi(a), atoi(b)) == 0 ? "ok" : "err ec";
-  if (!strcmp(cmd, "auto") && n == 2)
-    return g_ec.SetAuto(atoi(a)) == 0 ? "ok" : "err ec";
-  if (!strcmp(cmd, "mode") && n == 2) {
-    int m = g_ec.IsManual(atoi(a));
+  if (!strcmp(cmd, "rpm") && n == 2 && be) {
+    int rpm = 0;
+    if (be->ReadRpm(ch, &rpm) == 0) {
+      char buf[32];
+      sprintf_s(buf, "ok %d", rpm);
+      return buf;
+    }
+    return "err rpm";
+  }
+  if (!strcmp(cmd, "set") && n == 3 && be)
+    return be->SetPercent(ch, atoi(b)) == 0 ? "ok" : "err hw";
+  if (!strcmp(cmd, "auto") && n == 2 && be)
+    return be->SetAuto(ch) == 0 ? "ok" : "err hw";
+  if (!strcmp(cmd, "mode") && n == 2 && be) {
+    int m = be->IsManual(ch);
     if (m >= 0) {
       char buf[16];
       sprintf_s(buf, "ok %d", m);
       return buf;
     }
-    return "err ec";
+    return "err hw";
   }
   if (!strcmp(cmd, "temp")) {
     int t = g_temp.Read();
@@ -380,33 +851,11 @@ static std::string Handle(const std::string& line) {
     return "err sensor";
   }
   // "temps" -> "ok <label>=<celsius> [<label>=<celsius> ...]"
-  // EC thermal-sensor block THS0..THSF lives at 0xA8..0xB7 (ECMB maps there);
-  // entries reading 0x00 or >= 0x80 are unpopulated slots.
   if (!strcmp(cmd, "temps")) {
     std::string out = "ok";
     int c = g_temp.Read();
     if (c >= 0) out += " CPU=" + std::to_string(c);
-    // EC offsets 0xA8-0xB7 = mailbox THS0-THSF. Names 0-4 come from the
-    // DSDT's second Field(ECMB) block: CPUT/MSKT/AMBT/VDIN/PCHT.
-    // VDIN is the DC-input area thermistor per Insyde convention.
-    static const char* kThsName[16] = {"CPU_EC", "Skin",   "Ambient",
-                                       "DC-In",  "PCH",    nullptr,
-                                       nullptr,  nullptr,  nullptr,
-                                       nullptr,  nullptr,  nullptr,
-                                       nullptr,  nullptr,  nullptr,
-                                       nullptr};
-    for (int i = 0; i < 16; i++) {
-      ULONG64 v = 0;
-      if (g_ec.ReadReg(0xA8 + i, &v) == 0 && v >= 1 && v < 0x80) {
-        char buf[24];
-        if (kThsName[i]) {
-          sprintf_s(buf, " %s=%llu", kThsName[i], v);
-        } else {
-          sprintf_s(buf, " Zone_%d=%llu", i, v);
-        }
-        out += buf;
-      }
-    }
+    for (auto& b : g_backends) b->AppendTemps(&out);
     for (int d = 0; d < 8; d++) {
       int t = SsdTemp(d);
       if (t > 0) {
@@ -431,8 +880,8 @@ static DWORD WINAPI Watchdog(LPVOID) {
   while (g_running) {
     Sleep(5000);
     if (GetTickCount64() - g_lastCmd > kTimeoutMs) {
-      for (int i = 0; i < kFanCount; i++) {
-        if (g_ec.IsManual(i) == 1) g_ec.SetAuto(i);
+      for (auto& f : g_fans) {
+        if (f.first->IsManual(f.second) == 1) f.first->SetAuto(f.second);
       }
     }
   }
@@ -499,24 +948,27 @@ static DWORD WINAPI ServiceHandler(DWORD ctrl, DWORD, LPVOID, LPVOID) {
   return NO_ERROR;
 }
 
+static void ServiceRun() {
+  DetectBackends();
+  if (CpuTemp::Supported()) g_temp.Init();  // optional sensor
+  g_stopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  g_lastCmd = GetTickCount64();  // arm watchdog: clear stale holds if
+                                 // no app connects within the timeout
+  g_serverThread = CreateThread(nullptr, 0, PipeServer, nullptr, 0, nullptr);
+  CreateThread(nullptr, 0, Watchdog, nullptr, 0, nullptr);
+}
+
 static void WINAPI ServiceMain(DWORD, LPWSTR*) {
   g_ss = RegisterServiceCtrlHandlerExW(L"NetturbineFanHelper", ServiceHandler,
                                        nullptr);
   SERVICE_STATUS s{SERVICE_WIN32_OWN_PROCESS, SERVICE_START_PENDING, 0, 0};
   SetServiceStatus(g_ss, &s);
 
-  if (!g_ec.Init()) {
-    s.dwCurrentState = SERVICE_STOPPED;
-    s.dwWin32ExitCode = 2;
-    SetServiceStatus(g_ss, &s);
-    return;
-  }
-  g_temp.Init();  // optional — temp reports "err sensor" when unavailable
-  g_stopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-  g_lastCmd = GetTickCount64();  // arm watchdog: clear stale holds if
-                               // no app connects within the timeout
-  g_serverThread = CreateThread(nullptr, 0, PipeServer, nullptr, 0, nullptr);
-  CreateThread(nullptr, 0, Watchdog, nullptr, 0, nullptr);
+  ServiceRun();
+  char log[64];
+  sprintf_s(log, "fan_helper: %d fans, %d backends", (int)g_fans.size(),
+            (int)g_backends.size());
+  EventLog(log);
 
   s.dwCurrentState = SERVICE_RUNNING;
   s.dwControlsAccepted = SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN;
@@ -578,9 +1030,18 @@ int wmain(int argc, wchar_t** argv) {
     return 0;
   }
   if (argc > 1 && !wcscmp(argv[1], L"console")) {
-    if (!g_ec.Init()) { fprintf(stderr, "EC init: %s\n", g_ec.Error()); return 2; }
-    if (!g_temp.Init()) fprintf(stderr, "CPU temp sensor unavailable\n");
-    printf("EC ready, serving \\\\.\\pipe\\netturbine_fan\n");
+    DetectBackends();
+    if (CpuTemp::Supported() && !g_temp.Init()) {
+      fprintf(stderr, "CPU temp sensor unavailable\n");
+    }
+    std::string names;
+    for (auto& b : g_backends) {
+      if (!names.empty()) names += "+";
+      names += b->Name();
+    }
+    printf("backends: %s, %d fans\n", names.empty() ? "none" : names.c_str(),
+           (int)g_fans.size());
+    printf("serving \\\\.\\pipe\\netturbine_fan\n");
     g_lastCmd = GetTickCount64();
     CreateThread(nullptr, 0, Watchdog, nullptr, 0, nullptr);
     PipeServer(nullptr);

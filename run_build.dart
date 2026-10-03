@@ -15,7 +15,12 @@ const _toolsDir = r'windows\tools';
 /// PawnIO modules it loads from its own directory (see
 /// windows/tools/fan_helper.cpp). Without these the installed app can never
 /// register the NetturbineFanHelper service.
-const _helperFiles = ['fan_helper.exe', 'LpcACPIEC.bin', 'IntelMSR.bin'];
+const _helperFiles = [
+  'fan_helper.exe',
+  'LpcACPIEC.bin',
+  'LpcIO.bin',
+  'IntelMSR.bin',
+];
 
 String? findInnoBundleIscc() {
   final userProfile = Platform.environment['USERPROFILE'];
