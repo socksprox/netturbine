@@ -23,7 +23,7 @@ Native OS integration lives here. Keep the Flutter runner template as close to s
 - `ec_probe.exe` / `acpi_probe.exe` / `msr_probe.exe` in the same dir are standalone probes for debugging; `pipe_probe.ps1` sends one pipe command.
 - User-mode `IOCTL_ACPI_EVAL_METHOD` does **not** work on the OmniBook (interface rejects with ERROR_NOT_SUPPORTED) — don't retry that path; PawnIO is the mechanism.
 - RPM telemetry exists on the Super I/O path (`canReadRpm` via `caps` bit0); the OmniBook EC reports percent only.
-- **Temperatures**: CPU package via PawnIO `IntelMSR.bin` (`IA32_PACKAGE_THERM_STATUS` / `IA32_TEMPERATURE_TARGET`) — Intel-only, gated on `GenuineIntel` so the MSRs never execute on AMD; EC thermal-sensor block `THS0`–`THSF` at offsets `0xA8`–`0xB7` (OmniBook); Nuvoton temp inputs (CPUTIN→"CPU", SYSTIN→"Motherboard", AUXTINn→"Aux N", PECI→"CPU PECI") filtered to sane ranges; SSD/NVMe composite temp via `StorageDeviceTemperatureProperty` (`IOCTL_STORAGE_QUERY_PROPERTY` on `\\.\PhysicalDriveN`).
+- **Temperatures**: CPU package via PawnIO `IntelMSR.bin` (`IA32_PACKAGE_THERM_STATUS` / `IA32_TEMPERATURE_TARGET`) — Intel-only, gated on `GenuineIntel` so the MSRs never execute on AMD; EC thermal-sensor block `THS0`–`THSF` at offsets `0xA8`–`0xB7` (OmniBook); Nuvoton temp inputs (CPUTIN→"CPU socket", SYSTIN→"Motherboard", AUXTINn→"Aux N", PECI→"CPU PECI") filtered to sane ranges, identical readings deduplicated (boards mirror one physical source into several monitor slots); SSD/NVMe composite temp via `StorageDeviceTemperatureProperty` (`IOCTL_STORAGE_QUERY_PROPERTY` on `\\.\PhysicalDriveN`).
 
 ## Rules
 

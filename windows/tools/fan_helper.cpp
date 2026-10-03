@@ -239,17 +239,24 @@ class EcFans : public FanBackend {
                                        nullptr,  nullptr,  nullptr,
                                        nullptr};
     MutexLock lock(mutex_);
+    ULONG64 seen[16];
+    int seenCount = 0;
     for (int i = 0; i < 16; i++) {
       ULONG64 v = 0;
-      if (RawRead(0xA8 + i, &v) == 0 && v >= 1 && v < 0x80) {
-        char buf[24];
-        if (kThsName[i]) {
-          sprintf_s(buf, " %s=%llu", kThsName[i], v);
-        } else {
-          sprintf_s(buf, " Zone_%d=%llu", i, v);
-        }
-        *out += buf;
+      if (RawRead(0xA8 + i, &v) != 0 || v < 1 || v >= 0x80) continue;
+      // Slots mirroring the same physical source read identically —
+      // emit each distinct reading once.
+      bool dup = false;
+      for (int j = 0; j < seenCount; j++) dup |= seen[j] == v;
+      if (dup) continue;
+      seen[seenCount++] = v;
+      char buf[24];
+      if (kThsName[i]) {
+        sprintf_s(buf, " %s=%llu", kThsName[i], v);
+      } else {
+        sprintf_s(buf, " Zone_%d=%llu", i, v);
       }
+      *out += buf;
     }
   }
 
@@ -433,15 +440,23 @@ class SuperIoFans : public FanBackend {
   void AppendTemps(std::string* out) override {
     MutexLock lock(mutex_);
     const TempReg* temps = chip_->temps;
+    ULONG64 seen[16];
+    int seenCount = 0;
     for (int i = 0; temps[i].label; i++) {
       ULONG64 v = 0;
       // Temperatures are signed bytes; 0 and >= 0x7F are unpopulated or
       // invalid-source markers on this family.
-      if (HwRead(temps[i].reg, &v) == 0 && v >= 1 && v < 0x7F) {
-        char buf[24];
-        sprintf_s(buf, " %s=%llu", temps[i].label, v);
-        *out += buf;
-      }
+      if (HwRead(temps[i].reg, &v) != 0 || v < 1 || v >= 0x7F) continue;
+      // Boards routinely route one physical sensor to several monitor
+      // slots, which then report identical values — emit each distinct
+      // reading once so the UI shows no duplicates.
+      bool dup = false;
+      for (int j = 0; j < seenCount; j++) dup |= seen[j] == v;
+      if (dup) continue;
+      seen[seenCount++] = v;
+      char buf[24];
+      sprintf_s(buf, " %s=%llu", temps[i].label, v);
+      *out += buf;
     }
   }
 
@@ -618,16 +633,19 @@ const USHORT SuperIoFans::kModeReg[7] = {0x102, 0x202, 0x302, 0x802,
 const USHORT SuperIoFans::kFanCountReg[7] = {0x4B0, 0x4B2, 0x4B4, 0x4B6,
                                              0x4B8, 0x4BA, 0x4CC};
 
-// Temperature inputs for the NCT6791D-6799D family (CPUTIN = CPU source,
-// SYSTIN = motherboard, AUXTINn = board auxiliaries).
+// Temperature inputs for the NCT6791D-6799D family. CPUTIN is the socket
+// sensor (labeled CPU_socket so it can never collide with a CPU die temp
+// from another source), SYSTIN = motherboard, AUXTINn = board auxiliaries.
+// Primary/canonical names come first — on boards that mirror one physical
+// source into several slots, the first label wins the dedupe.
 const SuperIoFans::TempReg SuperIoFans::kTemps679x[] = {
-    {"CPU_PECI", 0x073}, {"CPU", 0x075}, {"Motherboard", 0x077},
-    {"Aux_0", 0x079},    {"Aux_1", 0x07B}, {"Aux_2", 0x07D},
-    {"Aux_3", 0x4A0},    {"Aux_4", 0x027}, {nullptr, 0}};
+    {"CPU_socket", 0x075}, {"Motherboard", 0x077}, {"CPU_PECI", 0x073},
+    {"Aux_0", 0x079},      {"Aux_1", 0x07B},       {"Aux_2", 0x07D},
+    {"Aux_3", 0x4A0},      {"Aux_4", 0x027},       {nullptr, 0}};
 const SuperIoFans::TempReg SuperIoFans::kTemps6779[] = {
-    {"CPU", 0x073},      {"Motherboard", 0x075}, {"CPU_PECI", 0x027},
-    {"Aux_0", 0x077},    {"Aux_1", 0x079},       {"Aux_2", 0x07B},
-    {"Aux_3", 0x150},    {nullptr, 0}};
+    {"CPU_socket", 0x073}, {"Motherboard", 0x075}, {"CPU_PECI", 0x027},
+    {"Aux_0", 0x077},      {"Aux_1", 0x079},       {"Aux_2", 0x07B},
+    {"Aux_3", 0x150},      {nullptr, 0}};
 
 // Chip-ID/revision table (config regs 0x20/0x21) for the family whose
 // register map above applies. Unknown IDs are left alone.
