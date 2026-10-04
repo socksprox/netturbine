@@ -222,6 +222,17 @@ void FlutterWindow::HandleSystemCall(
   } else if (name == "showWindow") {
     ShowAboveTray();
     result->Success();
+  } else if (name == "setWindowPinned") {
+    const auto* args = std::get_if<flutter::EncodableMap>(call.arguments());
+    bool pinned = false;
+    if (args != nullptr) {
+      auto it = args->find(flutter::EncodableValue("pinned"));
+      if (it != args->end()) {
+        pinned = std::get<bool>(it->second);
+      }
+    }
+    SetPinned(pinned);
+    result->Success();
   } else if (name == "quitApp") {
     DestroyWindow(GetHandle());  // -> WM_DESTROY -> PostQuitMessage
     result->Success();

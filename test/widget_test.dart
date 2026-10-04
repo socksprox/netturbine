@@ -85,4 +85,23 @@ void main() {
     expect(find.textContaining('No controllable fans'), findsOneWidget);
     expect(find.byType(Slider), findsNothing);
   });
+
+  testWidgets('pin button toggles windowPinned on state and system',
+      (tester) async {
+    final system = FakeSystemIntegration();
+    final state = AppState(fan: FakeFanController(), system: system);
+    await state.init();
+
+    await tester.pumpWidget(NetturbineApp(state: state));
+    await tester.pump();
+
+    expect(find.byIcon(Icons.push_pin_outlined), findsOneWidget);
+    await tester.tap(find.byIcon(Icons.push_pin_outlined));
+    await tester.pump();
+
+    expect(state.windowPinned, isTrue);
+    expect(system.windowPinned, isTrue);
+    expect(find.byIcon(Icons.push_pin), findsOneWidget);
+    state.dispose();
+  });
 }

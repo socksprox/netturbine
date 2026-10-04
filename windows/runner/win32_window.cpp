@@ -426,10 +426,11 @@ Win32Window::MessageHandler(HWND hwnd,
 
     case WM_ACTIVATE:
       if (LOWORD(wparam) == WA_INACTIVE) {
-        // Flyout behavior: clicking anywhere else dismisses it. Only stamp
-        // the time when the window was actually visible — a stale stamp
-        // would swallow the user's next tray click.
-        if (IsWindowVisible(window_handle_)) {
+        // Flyout behavior: clicking anywhere else dismisses it — unless the
+        // user pinned it open. Only stamp the time when the window was
+        // actually visible — a stale stamp would swallow the user's next
+        // tray click.
+        if (!pinned_ && IsWindowVisible(window_handle_)) {
           Hide();
           last_blur_hide_tick_ = GetTickCount64();
         }
@@ -487,6 +488,10 @@ HWND Win32Window::GetHandle() {
 
 void Win32Window::SetQuitOnClose(bool quit_on_close) {
   quit_on_close_ = quit_on_close;
+}
+
+void Win32Window::SetPinned(bool pinned) {
+  pinned_ = pinned;
 }
 
 bool Win32Window::OnCreate() {

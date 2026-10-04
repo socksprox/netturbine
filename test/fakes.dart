@@ -84,6 +84,7 @@ class FakeSystemIntegration implements SystemIntegration {
   bool setStartupShouldThrow = false;
   int showWindowCalls = 0;
   int quitCalls = 0;
+  bool windowPinned = false;
   String? settingsJson;
 
   @override
@@ -97,6 +98,9 @@ class FakeSystemIntegration implements SystemIntegration {
 
   @override
   Future<void> showWindow() async => showWindowCalls++;
+
+  @override
+  Future<void> setWindowPinned(bool pinned) async => windowPinned = pinned;
 
   @override
   Future<void> quitApp() async => quitCalls++;

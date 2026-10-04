@@ -53,6 +53,9 @@ class UnsupportedSystemIntegration implements SystemIntegration {
   Future<void> showWindow() async {}
 
   @override
+  Future<void> setWindowPinned(bool pinned) async {}
+
+  @override
   Future<void> quitApp() async {}
 
   @override

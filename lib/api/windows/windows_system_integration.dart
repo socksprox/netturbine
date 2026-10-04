@@ -11,6 +11,7 @@ import '../system_integration.dart';
 ///   getLaunchAtStartup()              -> bool
 ///   setLaunchAtStartup({enabled})     -> bool (success)
 ///   showWindow()                      -> null
+///   setWindowPinned({pinned})         -> null
 ///   quitApp()                         -> null
 class WindowsSystemIntegration implements SystemIntegration {
   static const _channel = MethodChannel('netturbine/system');
@@ -44,6 +45,15 @@ class WindowsSystemIntegration implements SystemIntegration {
   Future<void> showWindow() async {
     try {
       await _channel.invokeMethod('showWindow');
+    } on MissingPluginException {
+      // No-op when the host doesn't implement the channel.
+    }
+  }
+
+  @override
+  Future<void> setWindowPinned(bool pinned) async {
+    try {
+      await _channel.invokeMethod('setWindowPinned', {'pinned': pinned});
     } on MissingPluginException {
       // No-op when the host doesn't implement the channel.
     }

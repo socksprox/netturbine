@@ -106,7 +106,9 @@ void main() {
       state.setSpeed('cpu', 25);
       async.flushMicrotasks();
       expect(state.manualTarget('cpu'), isNull);
-      expect(state.backendError, isTrue);
+      // Backend errors debounce — a single failed write must not raise
+      // the banner (see _backendFailTicks).
+      expect(state.backendError, isFalse);
       state.dispose();
     });
   });

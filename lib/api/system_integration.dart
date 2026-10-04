@@ -18,6 +18,10 @@ abstract class SystemIntegration {
   /// Brings the app window to the foreground.
   Future<void> showWindow();
 
+  /// Pins the window open: it stays visible and on top when it loses
+  /// focus instead of auto-hiding. No-op where unsupported.
+  Future<void> setWindowPinned(bool pinned);
+
   /// Quits the app (as opposed to hiding the window to the tray).
   Future<void> quitApp();
 

@@ -5,6 +5,7 @@ import 'temp_page.dart';
 import 'widgets/boost_button.dart';
 import 'widgets/fan_card.dart';
 import 'widgets/mode_selector.dart';
+import 'widgets/pin_button.dart';
 import 'widgets/profile_editor.dart';
 import 'widgets/segmented_selector.dart';
 import 'widgets/settings_section.dart';
@@ -42,13 +43,18 @@ class _HomePageState extends State<HomePage> {
               children: [
                 Row(
                   children: [
-                    Icon(
-                      Icons.wind_power,
-                      size: 20,
-                      color: theme.colorScheme.primary,
+                    Image.asset(
+                      'windows/runner/resources/netturbine.png',
+                      width: 20,
+                      height: 20,
                     ),
                     const SizedBox(width: 8),
                     Text('netturbine', style: theme.textTheme.titleLarge),
+                    const Spacer(),
+                    PinButton(
+                      pinned: state.windowPinned,
+                      onChanged: state.setWindowPinned,
+                    ),
                   ],
                 ),
                 const SizedBox(height: 12),

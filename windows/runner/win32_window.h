@@ -50,6 +50,10 @@ class Win32Window {
   // Hides the window without closing it (tray behavior).
   void Hide();
 
+  // When pinned, the flyout stays visible (and on top) after losing
+  // activation instead of auto-hiding.
+  void SetPinned(bool pinned);
+
   // Release OS resources associated with window.
   void Destroy();
 
@@ -106,6 +110,9 @@ class Win32Window {
   void RemoveTrayIcon();
 
   bool quit_on_close_ = false;
+
+  // Pinned flyouts ignore the blur-driven Hide() in WM_ACTIVATE.
+  bool pinned_ = false;
 
   // GetTickCount64() of the last blur-driven Hide(). The tray click that
   // causes the blur would otherwise reopen the flyout a moment later.
