@@ -28,16 +28,18 @@ namespace {
 #define DWMWA_COLOR_NONE 0xFFFFFFFE
 #endif
 
-// Borderless flyout chrome (Win11+): small rounded corners matching the UI's
-// 8px radius, no DWM border, frame extended into the client area.
+// Borderless flyout chrome (Win11+): DWMWCP_ROUND clips the silhouette at
+// ~8px — the same radius the UI paints — and no DWM border. The frame is
+// extended just 1px at the bottom, which keeps the DWM drop shadow; a full
+// (-1) extension paints a dark frame edge along the inside of the window.
 void ApplyFlyoutChrome(HWND hwnd) {
-  constexpr DWORD kCornerRoundSmall = 3;  // DWMWCP_ROUND_SMALL
+  constexpr DWORD kCornerRound = 2;  // DWMWCP_ROUND
   DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE,
-                        &kCornerRoundSmall, sizeof(kCornerRoundSmall));
+                        &kCornerRound, sizeof(kCornerRound));
   const COLORREF border_none = DWMWA_COLOR_NONE;
   DwmSetWindowAttribute(hwnd, DWMWA_BORDER_COLOR, &border_none,
                         sizeof(border_none));
-  const MARGINS margins{-1, -1, -1, -1};
+  const MARGINS margins{0, 0, 0, 1};
   DwmExtendFrameIntoClientArea(hwnd, &margins);
 }
 
