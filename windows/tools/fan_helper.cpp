@@ -928,11 +928,10 @@ class AdlxFans : public FanBackend {
     if (f->targetMode) {
       adlx_int rpm = f->targetMax * pct / 100;
       if (pct > 0 && rpm < f->targetMin) rpm = f->targetMin;
-      ADLX_RESULT r = f->mft->SetTargetFanSpeed(rpm);
-      if (r == ADLX_RESET_NEEDED && ResetFactory(f)) {
-        r = f->mft->SetTargetFanSpeed(rpm);
+      if (ADLX_FAILED(WriteTuning(
+              f, [&] { return f->mft->SetTargetFanSpeed(rpm); }))) {
+        return -1;
       }
-      if (ADLX_FAILED(r)) return -1;
     } else if (f->states) {
       for (adlx_uint k = f->states->Begin(); k < f->states->End(); k++) {
         IADLXManualFanTuningStatePtr s;
@@ -978,11 +977,10 @@ class AdlxFans : public FanBackend {
         adlx_int dd = 0;
         if (ADLX_SUCCEEDED(f->mft1->GetTargetFanSpeedDefault(&dd))) dv = dd;
       }
-      ADLX_RESULT r = f->mft->SetTargetFanSpeed(dv);
-      if (r == ADLX_RESET_NEEDED && ResetFactory(f)) {
-        r = f->mft->SetTargetFanSpeed(dv);
+      if (ADLX_FAILED(WriteTuning(
+              f, [&] { return f->mft->SetTargetFanSpeed(dv); }))) {
+        return -1;
       }
-      if (ADLX_FAILED(r)) return -1;
     }
     f->manual = false;
     return 0;
@@ -1084,19 +1082,26 @@ class AdlxFans : public FanBackend {
     return ADLX_SUCCEEDED(tuning_->ResetToFactory(f->gpu));
   }
 
-  void SetZeroRpm(GpuFan* f, bool on) {
-    ADLX_RESULT r = f->mft->SetZeroRPMState(on);
-    if (r == ADLX_RESET_NEEDED && ResetFactory(f)) {
-      f->mft->SetZeroRPMState(on);
+  // Tuning writes can also fail transiently (driver contention, a
+  // reset already in flight) — retry once after a short pause so one
+  // flake doesn't surface as "err hw" to the UI.
+  template <typename Fn>
+  ADLX_RESULT WriteTuning(GpuFan* f, Fn&& call) {
+    ADLX_RESULT r = call();
+    if (ADLX_FAILED(r)) {
+      if (r == ADLX_RESET_NEEDED) ResetFactory(f);
+      Sleep(50);
+      r = call();
     }
+    return r;
+  }
+
+  void SetZeroRpm(GpuFan* f, bool on) {
+    WriteTuning(f, [&] { return f->mft->SetZeroRPMState(on); });
   }
 
   ADLX_RESULT ApplyStates(GpuFan* f, IADLXManualFanTuningStateList* list) {
-    ADLX_RESULT r = f->mft->SetFanTuningStates(list);
-    if (r == ADLX_RESET_NEEDED && ResetFactory(f)) {
-      r = f->mft->SetFanTuningStates(list);
-    }
-    return r;
+    return WriteTuning(f, [&] { return f->mft->SetFanTuningStates(list); });
   }
 
   // ADLX contract: every interface must be released before

@@ -42,6 +42,12 @@ class AppState extends ChangeNotifier {
   /// Guards against transient `temps` failures pulsing the fans.
   static const _sensorGraceTicks = 3;
 
+  /// Consecutive failed backend writes tolerated before the
+  /// "backend unavailable" banner shows. Some backends (ADLX GPU
+  /// tuning) can fail a single call transiently while the next one
+  /// succeeds — one miss must not flash the banner.
+  static const _backendFailTicks = 3;
+
   final FanController fan;
   final SystemIntegration system;
   StreamSubscription<List<FanInfo>>? _sub;
@@ -49,6 +55,7 @@ class AppState extends ChangeNotifier {
   List<FanInfo> fans = const [];
   List<TempSensor> sensors = const [];
   bool launchAtStartup = false;
+  bool windowPinned = false;
   bool backendError = false;
 
   FanMode fanMode = FanMode.auto;
@@ -70,6 +77,19 @@ class AppState extends ChangeNotifier {
 
   Timer? _boostTimer;
   Duration? _boostRemaining;
+  int _backendFails = 0;
+
+  /// A backend write succeeded — clear any error state immediately.
+  void _backendOk() {
+    _backendFails = 0;
+    backendError = false;
+  }
+
+  /// A backend write threw. The banner only appears after several
+  /// consecutive failures; it clears itself on the next success.
+  void _backendFailed() {
+    if (++_backendFails >= _backendFailTicks) backendError = true;
+  }
 
   FanCapabilities get capabilities => fan.capabilities;
   bool get isBoosting => _boostRemaining != null;
@@ -97,11 +117,12 @@ class AppState extends ChangeNotifier {
       }
       notifyListeners();
     }, onError: (_) {
-      backendError = true;
+      _backendFailed();
       notifyListeners();
     });
     launchAtStartup = await system.isLaunchAtStartupEnabled();
     await _loadSettings();
+    if (windowPinned) unawaited(system.setWindowPinned(true));
     notifyListeners();
   }
 
@@ -112,7 +133,7 @@ class AppState extends ChangeNotifier {
     if (fanMode == FanMode.auto) return;
     fanMode = FanMode.auto;
     activeProfileId = null;
-    backendError = false;
+    _backendOk();
     await _applyMode();
     notifyListeners();
     unawaited(_persist());
@@ -124,7 +145,7 @@ class AppState extends ChangeNotifier {
     if (fanMode == FanMode.fixed) return;
     fanMode = FanMode.fixed;
     activeProfileId = null;
-    backendError = false;
+    _backendOk();
     for (final f in fans.where((f) => f.canControl)) {
       _manualTargets[f.id] ??= f.speedPercent ?? 50;
     }
@@ -139,7 +160,7 @@ class AppState extends ChangeNotifier {
     fanMode = FanMode.profile;
     activeProfileId = id;
     _lastCurvePercent = null;
-    backendError = false;
+    _backendOk();
     await _applyMode();
     notifyListeners();
     unawaited(_persist());
@@ -157,6 +178,7 @@ class AppState extends ChangeNotifier {
           for (final f in fans.where((f) => f.canControl)) {
             await fan.resetToAuto(f.id);
           }
+          _backendOk();
         case FanMode.fixed:
           _curveHolding = false;
           _lastCurvePercent = null;
@@ -164,12 +186,13 @@ class AppState extends ChangeNotifier {
               (f) => f.canControl && _manualTargets.containsKey(f.id))) {
             await fan.setSpeed(f.id, _manualTargets[f.id]!);
           }
+          _backendOk();
         case FanMode.profile:
           _lastCurvePercent = null;  // force a write — e.g. post-boost the
           await _applyCurve();       // EC holds 100% but the curve value didn't move
       }
     } on FanControlException {
-      backendError = true;
+      _backendFailed();
     }
   }
 
@@ -223,9 +246,10 @@ class AppState extends ChangeNotifier {
       }
       _curveHolding = true;
       _lastCurvePercent = effective;
+      _backendOk();
       notifyListeners();
     } on FanControlException {
-      backendError = true;
+      _backendFailed();
     } finally {
       _curveBusy = false;
     }
@@ -289,22 +313,22 @@ class AppState extends ChangeNotifier {
     final effective =
         percent > 0 && percent < _minSpinPercent ? 0 : percent;
     try {
-      backendError = false;
       await fan.setSpeed(fanId, effective);
       _manualTargets[fanId] = effective;
+      _backendOk();
     } on FanControlException {
-      backendError = true;
+      _backendFailed();
     }
     notifyListeners();
   }
 
   Future<void> resetToAuto(String fanId) async {
     try {
-      backendError = false;
       await fan.resetToAuto(fanId);
       _manualTargets.remove(fanId);
+      _backendOk();
     } on FanControlException {
-      backendError = true;
+      _backendFailed();
     }
     notifyListeners();
   }
@@ -316,14 +340,14 @@ class AppState extends ChangeNotifier {
   Future<void> startBoost([Duration duration = boostDuration]) async {
     _boostTimer?.cancel();
     try {
-      backendError = false;
       for (final f in fans.where((f) => f.canControl)) {
         await fan.setSpeed(f.id, 100);
       }
       _boostRemaining = duration;
       _boostTimer = Timer.periodic(_boostTick, (_) => _tickBoost());
+      _backendOk();
     } on FanControlException {
-      backendError = true;
+      _backendFailed();
       _boostRemaining = null;
     }
     notifyListeners();
@@ -347,7 +371,6 @@ class AppState extends ChangeNotifier {
     _boostTimer?.cancel();
     _boostTimer = null;
     _boostRemaining = null;
-    backendError = false;
     await _applyMode();
     notifyListeners();
   }
@@ -367,6 +390,15 @@ class AppState extends ChangeNotifier {
 
   Future<void> showWindow() => system.showWindow();
 
+  /// Pin keeps the flyout visible on blur and always on top.
+  Future<void> setWindowPinned(bool pinned) async {
+    if (windowPinned == pinned) return;
+    windowPinned = pinned;
+    notifyListeners();
+    await system.setWindowPinned(pinned);
+    unawaited(_persist());
+  }
+
   Future<void> quitApp() => system.quitApp();
 
   // ------------------------------------------------------- persistence
@@ -374,6 +406,7 @@ class AppState extends ChangeNotifier {
   Future<void> _persist() =>
       system.saveSettings(jsonEncode({
         'mode': fanMode.name,
+        'pinned': windowPinned,
         'profile': activeProfileId,
         'fixed': _manualTargets,
         'profiles': [for (final p in profiles) p.toJson()],
@@ -419,6 +452,7 @@ class AppState extends ChangeNotifier {
         }
       }
     }
+    windowPinned = json['pinned'] == true;
     final profile = json['profile'];
     if (profile is String && profiles.any((p) => p.id == profile)) {
       activeProfileId = profile;
